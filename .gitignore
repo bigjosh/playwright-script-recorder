@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.pyc
+
+# Recorder artifacts: capture baselines and diff dumps live next to the
+# scripts that use them; commit them deliberately if a script is shared.
+capture-*.png
+compare-diff-*.png
