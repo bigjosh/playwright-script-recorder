@@ -40,12 +40,13 @@ which Chrome's debug port does not listen on.
 python playwrightscriptrecord.py
 ```
 
-It asks for a script filename and the debug URL (`http://127.0.0.1:9222` is
-the best answer — the `ws://` form also works but changes every Chrome
-restart). If several tabs are open, it also asks which one the script
-should drive. Then a menu loops: Click, Double Click, Send Keys, Grab a
-frame, Compare, Wait, End. Every action is performed live in the browser as
-it is recorded, and the script file is saved after each step.
+It asks for a script filename, whether replays should log their output to
+`<scriptname>.log` (default yes — emits `psl.logging(True)` into the
+script), and the debug URL (`http://127.0.0.1:9222` is the best answer —
+the `ws://` form also works but changes every Chrome restart). If several
+tabs are open, it also asks which one the script should drive. Then a menu loops: Click, Double Click, Send Keys, Screen
+Test, Wait, End. Every action is performed live in the browser as it is
+recorded, and the script file is saved after each step.
 
 **Immediate mode**: press Enter at the filename prompt instead of naming a
 file. Each action still runs in the browser right away, but its code block
@@ -57,17 +58,19 @@ blocks into a `.py` file. Captures still save PNGs (named
 
 - **Click / Double Click** — a screenshot pops up; click the target spot.
 - **Send Keys** — type the text; write `\r` where Enter should be pressed.
-- **Grab a frame** — name it, then drag a rectangle on the screenshot. The
-  image as captured during recording is saved next to the script as
-  `capture-<script>-<name>-<x1>,<y1>,<x2>,<y2>.png` (grabbing the same name
-  again replaces it). Nothing runs at replay time for a grab — the PNG *is*
-  the baseline.
-- **Compare** — pick one of the capture PNGs found next to the script; at
-  that point in the replay the script re-grabs the same region and
-  `alarm()`s if the screen no longer matches the PNG. The recorder shows
-  the live similarity score to help you choose a `matchLevel` (default
-  0.98; lower = more tolerant).
-- **Wait** — inserts a pause; useful before compares when the page or a
+  Before typing, `Home` + `Shift+End` are pressed so the field's existing
+  content is selected and **replaced** (deterministic in every Windows edit
+  control, unlike double-click selection which skips a leading `-`); the
+  prefix repeats after each `\r`, and `psl.sendkeys(text,
+  HomeShiftEndPrefix=False)` appends instead.
+- **Screen Test** — name it, then drag a rectangle on the screenshot. The
+  area as captured during recording is saved next to the script as
+  `capture-<script>-<name>-<x1>,<y1>,<x2>,<y2>.png` (reusing a name
+  replaces its capture), and the script gets a check at this point of the
+  replay: re-grab the same area and raise the alarm if it no longer
+  matches the saved PNG. The `matchLevel` (default 0.98; lower = more
+  tolerant) and the alarm message are prompted with sensible defaults.
+- **Wait** — inserts a pause; useful before screen tests when the page or a
   remote-desktop stream needs time to settle.
 
 ## 3. Replay
@@ -79,16 +82,28 @@ python myscript.py [debug-url]
 Keep recorded scripts in this folder (they `import playwrightscriptlib`).
 The optional argument overrides the debug URL recorded in the script.
 
+If logging was enabled at record time (`psl.logging(True)` in the script),
+every printed line — steps, alarms, operator answers, error tracebacks —
+is also appended to `<scriptname>.log` next to the script; each run starts
+with a dated header, so the log accumulates a history across runs.
+
+To single-step a script, add `psl.pauseOnInfo(True)` (right after the
+header, or just before a section you want to debug): every info line then
+pauses with a popup offering **Next Step**, **Run Continuously** (turns
+stepping off), and **STOP** (exit code 2). Closing the popup continues
+without stepping; with no display it falls back to a console prompt where
+plain Enter means next step.
+
 While running, the script prints a timestamped line before every step,
 including your recorded comment:
 
 ```
 [12:15:44] Click at (200, 60)
-[12:15:44] Compare screen to capture 'boxframe' (matchLevel 0.98) -- check box unchanged
+[12:15:44] Screen test 'boxframe' (matchLevel 0.98) -- check box unchanged
 ```
 
-On a compare mismatch the script pops an always-on-top red window, beeps
-loudly, and offers four choices:
+When a screen test fails, the script pops an always-on-top red window,
+beeps loudly, and offers four choices:
 
 - **Try compare again** — e.g. after you manually put the target page back
   into the right state

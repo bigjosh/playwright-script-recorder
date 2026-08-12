@@ -22,10 +22,9 @@ What should we do next?
 1. Click
 2. Double Click
 3. Send Keys
-4. Grab a frame
-5. Compare screen to a captured frame and alert if different
-6. Wait
-7. End
+4. Screen Test (capture an area now, alert on replay if it changed)
+5. Wait
+6. End
 """
 
 # capture-<scriptbase>-<capturename>-<x1>,<y1>,<x2>,<y2>.png
@@ -261,61 +260,27 @@ def do_sendkeys(writer):
     print("Keys sent and recorded.")
 
 
-def do_grab(writer, script_base, script_dir):
+def do_screen_test(writer, script_base, script_dir):
     comment = ask_comment()
     while True:
-        name = input("Name for this capture (letters, digits, underscore): ").strip()
+        name = input("Name for this screen test (letters, digits, underscore): ").strip()
         if not name:
             continue
         if not name.isidentifier() or keyword.iskeyword(name) or name.startswith("_"):
             print("Please use letters/digits/underscore, not starting with a digit or underscore.")
             continue
         if list_captures(script_dir, script_base, name) and input(
-                "Capture '%s' already exists -- replace it? [y/N]: " % name).strip().lower() != "y":
+                "Screen test '%s' already has a capture -- replace it? [y/N]: "
+                % name).strip().lower() != "y":
             continue
         break
-    print("Taking screenshot -- drag a rectangle around the region...")
+    print("Taking screenshot -- drag a rectangle around the area to test...")
     img = psl.viewportGrab()
-    box = _run_picker(img, "Capture '%s' -- drag the region" % name, "rect")
+    box = _run_picker(img, "Screen test '%s' -- drag the area" % name, "rect")
     if box is None:
-        print("Cancelled -- nothing captured.")
+        print("Cancelled -- nothing recorded.")
         return
-    # the saved baseline is the exact crop of the screenshot the user picked on
-    frame = img.crop(box)
-    for old_fn, _, _, _ in list_captures(script_dir, script_base, name):
-        os.remove(os.path.join(script_dir, old_fn))
-    png_name = capture_filename(script_base, name, box)
-    frame.save(os.path.join(script_dir, png_name))
-    body = []
-    if comment:
-        body.append("# " + comment)
-    body.append("# capture '%s' saved at record time to %s" % (name, png_name))
-    writer.note(*body)
-    print("Capture '%s' saved to %s" % (name, os.path.join(script_dir, png_name)))
-
-
-def do_compare(writer, script_dir):
-    captures = list_captures(script_dir)
-    if not captures:
-        print("No capture PNGs found next to the script -- use option 4 first.")
-        return
-    comment = ask_comment()
-    print("Available captures:")
-    for i, (fn, name, box, base) in enumerate(captures, 1):
-        print("  %d. %s  (%d, %d)-(%d, %d)  [%s]" % ((i, name) + box + (fn,)))
-    while True:
-        s = input("Compare against which capture? [1]: ").strip() or "1"
-        if s.isdigit() and 1 <= int(s) <= len(captures):
-            fn, name, box, base = captures[int(s) - 1]
-            break
-        print("Please choose 1-%d." % len(captures))
     x1, y1, x2, y2 = box
-
-    baseline = psl.loadFrame(os.path.join(script_dir, fn))
-    fresh = psl.frameGrab(x1, y1, x2, y2)
-    score = psl.frameSimilarity(baseline, fresh)
-    print("Similarity to '%s' right now: %.4f  (1.0 = identical; pick a matchLevel below it)"
-          % (name, score))
 
     while True:
         s = input("matchLevel 0.0-1.0 [0.98]: ").strip() or "0.98"
@@ -328,11 +293,19 @@ def do_compare(writer, script_dir):
         print("Enter a number between 0.0 and 1.0.")
     message = input("Alarm message [Screen does not match %s]: " % name).strip() \
         or "Screen does not match %s" % name
+
+    # the saved baseline is the exact crop of the screenshot the user picked on
+    for old_fn, _, _, _ in list_captures(script_dir, script_base, name):
+        os.remove(os.path.join(script_dir, old_fn))
+    png_name = capture_filename(script_base, name, box)
+    img.crop(box).save(os.path.join(script_dir, png_name))
+
     writer.action(comment,
-                  "Compare screen to capture '%s' (matchLevel %s)" % (name, level),
+                  "Screen test '%s' (matchLevel %s)" % (name, level),
                   "psl.verifyFrame(%r, (%d, %d, %d, %d), %s, %r)"
-                  % (fn, x1, y1, x2, y2, level, message))
-    print("Compare against %s recorded (matchLevel %s)." % (fn, level))
+                  % (png_name, x1, y1, x2, y2, level, message))
+    print("Screen test '%s' recorded; baseline saved to %s"
+          % (name, os.path.join(script_dir, png_name)))
 
 
 def do_wait(writer):
@@ -375,6 +348,10 @@ def main():
         script_dir = os.path.dirname(script_path)
         script_base = os.path.splitext(os.path.basename(script_path))[0]
 
+    log_display = ("%s.log" % script_base) if fname is not None else "<scriptname>.log"
+    want_log = input("Log output to %s when the script runs? [Y/n]: "
+                     % log_display).strip().lower() != "n"
+
     print()
     print(DEBUG_URL_HELP)
     while True:
@@ -416,19 +393,24 @@ def main():
     else:
         writer = ScriptWriter(fname)
         print("Writing to %s (saved after every step)." % fname)
-    writer.header([
+    header = [
         "# Recorded by playwrightscriptrecord.py on %s"
         % datetime.now().strftime("%Y-%m-%d %H:%M"),
         "import sys",
         "",
         "import playwrightscriptlib as psl",
         "",
+    ]
+    if want_log:
+        header.append("psl.logging(True)")
+    header += [
         "psl.alarmOnError()",
         "psl.info('Connecting to the browser')",
         "psl.connect(sys.argv[1] if len(sys.argv) > 1 else %r, page_hint=%r)"
         % (url, hint),
         "psl.checkViewport(%d, %d)" % (vw, vh),
-    ])
+    ]
+    writer.header(header)
 
     while True:
         print(MENU)
@@ -441,15 +423,13 @@ def main():
             elif choice == "3":
                 do_sendkeys(writer)
             elif choice == "4":
-                do_grab(writer, script_base, script_dir)
+                do_screen_test(writer, script_base, script_dir)
             elif choice == "5":
-                do_compare(writer, script_dir)
-            elif choice == "6":
                 do_wait(writer)
-            elif choice == "7":
+            elif choice == "6":
                 break
             else:
-                print("Please choose 1-7.")
+                print("Please choose 1-6.")
         except Exception as e:
             print("Action failed (nothing was recorded for it): %s" % e)
 

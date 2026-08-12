@@ -46,6 +46,23 @@ DIFF_TOLERANCE = 25    # per-pixel max channel difference (0-255) counted as "sa
 _pw = None
 _browser = None
 _page = None
+_log = None
+_pause_on_info = False
+
+
+def _log_write(text):
+    if _log is not None:
+        try:
+            _log.write(text + "\n")
+            _log.flush()
+        except Exception:
+            pass
+
+
+def _emit(text):
+    """Print a line and mirror it into the log file when logging is on."""
+    print(text, flush=True)
+    _log_write(text)
 
 
 def _require_page():
@@ -143,16 +160,31 @@ def doubleClick(x, y):
     _require_page().mouse.dblclick(x, y)
 
 
-def sendkeys(text, delay=20):
+def sendkeys(text, delay=20, HomeShiftEndPrefix=True):
     r"""Type text into the focused element; \r (or \n) presses Enter.
 
     delay is milliseconds between keystrokes -- keep a little so keys
     forwarded through remote-desktop sessions are not dropped.
+
+    HomeShiftEndPrefix (default True) presses Home then Shift+End before
+    typing, selecting the field's entire existing content so the typed
+    text REPLACES it.  This is deterministic in every Windows edit control
+    (unlike double-click word selection, which skips things like a leading
+    '--').  The prefix repeats for each \r-separated chunk, so chained
+    "value\rvalue" entries clean each field they land in; pass
+    HomeShiftEndPrefix=False to append to existing content instead.
     """
     page = _require_page()
     normalized = text.replace("\r\n", "\r").replace("\n", "\r")
     parts = normalized.split("\r")
     for i, part in enumerate(parts):
+        if part and HomeShiftEndPrefix:
+            page.keyboard.press("Home")
+            if delay:
+                time.sleep(delay / 1000.0)
+            page.keyboard.press("Shift+End")
+            if delay:
+                time.sleep(delay / 1000.0)
         if part:
             page.keyboard.type(part, delay=delay)
         if i < len(parts) - 1:
@@ -479,8 +511,127 @@ def wait(seconds):
 
 def info(message):
     """Print a timestamped progress line; recorded scripts call this before
-    each action so the console shows what is happening and when."""
-    print("[%s] %s" % (time.strftime("%H:%M:%S"), message), flush=True)
+    each action so the console shows what is happening and when.
+
+    With pauseOnInfo(True) active, each info line also pauses the script
+    until the operator chooses how to proceed."""
+    _emit("[%s] %s" % (time.strftime("%H:%M:%S"), message))
+    if _pause_on_info:
+        _step_pause(message)
+
+
+def pauseOnInfo(enabled):
+    """Single-step mode for recorded scripts.
+
+    When enabled, every info() line pauses the script with a popup showing
+    the message and three buttons:
+
+      Next Step        -- run up to the next info() line, then pause again
+      Run Continuously -- turn stepping off and let the script run normally
+      STOP             -- abort the script immediately (exit code 2)
+
+    The recorder writes an info() line before every action, so this steps
+    through a script action by action.  Closing the popup (or console EOF
+    when there is no display) counts as Run Continuously, so an accidental
+    close never kills the script; the console fallback treats a plain
+    Enter as Next Step.
+    """
+    global _pause_on_info
+    _pause_on_info = bool(enabled)
+    _emit("[%s] Step mode %s" % (time.strftime("%H:%M:%S"),
+                                 "on -- pausing at every step" if enabled else "off"))
+
+
+def _step_pause(message):
+    global _pause_on_info
+    buttons = ("Next Step", "Run Continuously", "STOP")
+    try:
+        choice = _pause_window(message, buttons)
+    except Exception:
+        choice = _pause_console(message, buttons)
+    if choice == 0:
+        return
+    if choice == 1:
+        _pause_on_info = False
+        _emit("[%s] Running continuously -- step mode off" % time.strftime("%H:%M:%S"))
+        return
+    _emit("[%s] Script stopped by operator (step mode)" % time.strftime("%H:%M:%S"))
+    sys.exit(2)
+
+
+def _pause_window(message, buttons):
+    import tkinter as tk
+
+    result = {"choice": 1}  # closing the window = Run Continuously
+    root = tk.Tk()
+    root.title("Step mode -- script paused")
+    root.configure(bg="#1f4e79")
+    root.attributes("-topmost", True)
+    tk.Label(root, text="⏸ PAUSED", font=("Segoe UI", 24, "bold"),
+             fg="white", bg="#1f4e79").pack(padx=40, pady=(24, 8))
+    tk.Label(root, text=message, font=("Segoe UI", 14), fg="white",
+             bg="#1f4e79", wraplength=640, justify="center").pack(padx=40, pady=8)
+
+    def pick(index):
+        result["choice"] = index
+        root.destroy()
+
+    row = tk.Frame(root, bg="#1f4e79")
+    row.pack(padx=30, pady=(8, 24))
+    for i, label in enumerate(buttons):
+        tk.Button(row, text=label, font=("Segoe UI", 12, "bold"),
+                  command=lambda i=i: pick(i), padx=16, pady=6).pack(side="left", padx=8)
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    root.update_idletasks()
+    x = (root.winfo_screenwidth() - root.winfo_width()) // 2
+    y = (root.winfo_screenheight() - root.winfo_height()) // 3
+    root.geometry("+%d+%d" % (x, y))
+    root.lift()
+    root.focus_force()
+    root.mainloop()
+    return result["choice"]
+
+
+def _pause_console(message, buttons):
+    for i, label in enumerate(buttons, 1):
+        print("  %d. %s" % (i, label), flush=True)
+    while True:
+        try:
+            s = input("*** Paused -- choose 1-%d [1]: " % len(buttons)).strip()
+        except EOFError:
+            return 1  # nobody at the console -> run continuously
+        if not s:
+            return 0  # plain Enter steps to the next info line
+        if s.isdigit() and 1 <= int(s) <= len(buttons):
+            return int(s) - 1
+
+
+def logging(enabled, path=None):
+    """Append every output line this library prints to a log file.
+
+    psl.logging(True) opens <scriptname>.log next to the running script in
+    append mode (each run adds a dated session header) and mirrors info()
+    lines, alarm lines, operator answers and error tracebacks into it.
+    psl.logging(False) turns it off.  path overrides the file location.
+    """
+    global _log
+    if _log is not None:
+        try:
+            _log.close()
+        except Exception:
+            pass
+        _log = None
+    if not enabled:
+        return
+    if path is None:
+        base = sys.argv[0] if sys.argv and sys.argv[0] else "playwrightscript"
+        path = os.path.splitext(os.path.abspath(base))[0] + ".log"
+    _log = open(path, "a", encoding="utf-8")
+    _log.write("===== %s -- log opened by %s =====\n"
+               % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                  os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else "?"))
+    _log.flush()
+    info("Logging to %s" % os.path.abspath(path))
 
 
 def _beep_loop(stop):
@@ -564,7 +715,7 @@ def alarm(message, buttons=("Acknowledge",)):
     is available; closing the window (or console EOF) counts as the LAST
     button, so put the safe/abort choice last.
     """
-    print("*** ALARM: %s" % message, flush=True)
+    _emit("*** ALARM: %s" % message)
     stop = threading.Event()
     beeper = threading.Thread(target=_beep_loop, args=(stop,), daemon=True)
     beeper.start()
@@ -576,7 +727,7 @@ def alarm(message, buttons=("Acknowledge",)):
     finally:
         stop.set()
         beeper.join(timeout=2)
-    print("*** Alarm answered: %s" % buttons[choice], flush=True)
+    _emit("*** Alarm answered: %s" % buttons[choice])
     return choice
 
 
@@ -584,6 +735,7 @@ def alarmOnError():
     """Make any uncaught exception in the script raise alarm(), then exit 1."""
     def _hook(exc_type, exc, tb):
         traceback.print_exception(exc_type, exc, tb)
+        _log_write("".join(traceback.format_exception(exc_type, exc, tb)).rstrip())
         summary = "".join(traceback.format_exception_only(exc_type, exc)).strip()
         alarm("Script error: %s" % summary)
     sys.excepthook = _hook
