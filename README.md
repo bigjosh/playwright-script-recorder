@@ -94,6 +94,15 @@ stepping off), and **STOP** (exit code 2). Closing the popup continues
 without stepping; with no display it falls back to a console prompt where
 plain Enter means next step.
 
+Waits longer than 3 seconds show a countdown window with **Skip wait** and
+**Abort script** (exit code 2) buttons — handy during long process waits.
+Closing the window only hides the countdown; the remaining time still
+elapses. The threshold is `WAIT_POPUP_MIN` at the top of the library.
+
+`psl.clicksSettleTime(0.5)` adds a silent pause (fractional seconds fine)
+after every click and double click — useful when the target UI needs a
+beat to react between actions. `0` (the default) turns it off.
+
 While running, the script prints a timestamped line before every step,
 including your recorded comment:
 

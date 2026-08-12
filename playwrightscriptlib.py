@@ -43,11 +43,14 @@ BLUR_RADIUS = 1.5      # gaussian blur applied to both frames before diffing
 DOWNSAMPLE = 2         # integer shrink factor applied after the blur
 DIFF_TOLERANCE = 25    # per-pixel max channel difference (0-255) counted as "same"
 
+WAIT_POPUP_MIN = 3     # wait() longer than this (seconds) shows the countdown popup
+
 _pw = None
 _browser = None
 _page = None
 _log = None
 _pause_on_info = False
+_clicks_settle_time = 0.0
 
 
 def _log_write(text):
@@ -150,14 +153,31 @@ def usePage(index):
     return _page
 
 
+def clicksSettleTime(seconds):
+    """Silently pause this many seconds after every click()/doubleClick().
+
+    Gives a slow UI (or a remote-desktop stream) time to react before the
+    script moves on.  Fractional values are fine; 0 (the default) disables
+    the pause.  The pause is a plain sleep -- no popup, no way to skip.
+    """
+    global _clicks_settle_time
+    _clicks_settle_time = max(0.0, float(seconds))
+    _emit("[%s] Click settle time set to %gs"
+          % (time.strftime("%H:%M:%S"), _clicks_settle_time))
+
+
 def click(x, y):
     """Single left click at (x, y), CSS pixels from the viewport's top-left."""
     _require_page().mouse.click(x, y)
+    if _clicks_settle_time > 0:
+        time.sleep(_clicks_settle_time)
 
 
 def doubleClick(x, y):
     """Double left click at (x, y), CSS pixels from the viewport's top-left."""
     _require_page().mouse.dblclick(x, y)
+    if _clicks_settle_time > 0:
+        time.sleep(_clicks_settle_time)
 
 
 def sendkeys(text, delay=20, HomeShiftEndPrefix=True):
@@ -504,9 +524,104 @@ def verifyFrame(baselinePath, box, matchLevel, message):
         sys.exit(2)
 
 
+def _fmt_remaining(seconds):
+    whole = int(seconds) + (1 if seconds % 1 else 0)
+    if whole >= 60:
+        return "%d:%02d" % divmod(whole, 60)
+    return "%ds" % whole
+
+
+def _wait_window(seconds):
+    """Countdown window for wait().  Returns (outcome, remaining_seconds)
+    where outcome is 'done', 'skip', 'abort', or 'dismissed' (window
+    closed; the caller still waits out the remaining time)."""
+    import tkinter as tk
+
+    deadline = time.monotonic() + seconds
+    result = {"outcome": "dismissed"}
+    root = tk.Tk()
+    root.title("Waiting -- script paused on a timer")
+    root.configure(bg="#1e5631")
+    root.attributes("-topmost", True)
+    tk.Label(root, text="⏳ WAITING", font=("Segoe UI", 22, "bold"),
+             fg="white", bg="#1e5631").pack(padx=40, pady=(22, 4))
+    remaining_label = tk.Label(root, text=_fmt_remaining(seconds),
+                               font=("Segoe UI", 30, "bold"),
+                               fg="white", bg="#1e5631")
+    remaining_label.pack(padx=40, pady=2)
+    tk.Label(root, text="of %g second(s)" % seconds, font=("Segoe UI", 12),
+             fg="white", bg="#1e5631").pack(padx=40, pady=(0, 8))
+
+    timer = {"id": None}
+
+    def close(outcome):
+        result["outcome"] = outcome
+        if timer["id"] is not None:
+            try:
+                root.after_cancel(timer["id"])
+            except Exception:
+                pass
+        root.destroy()
+
+    row = tk.Frame(root, bg="#1e5631")
+    row.pack(padx=30, pady=(4, 22))
+    tk.Button(row, text="Skip wait", font=("Segoe UI", 12, "bold"),
+              command=lambda: close("skip"), padx=16, pady=6).pack(side="left", padx=8)
+    tk.Button(row, text="Abort script", font=("Segoe UI", 12, "bold"),
+              command=lambda: close("abort"), padx=16, pady=6).pack(side="left", padx=8)
+
+    def tick():
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timer["id"] = None
+                close("done")
+                return
+            remaining_label.config(text=_fmt_remaining(remaining))
+            timer["id"] = root.after(200, tick)
+        except Exception:
+            pass
+
+    tick()
+    root.protocol("WM_DELETE_WINDOW", lambda: close("dismissed"))  # X = hide, keep waiting
+    root.update_idletasks()
+    x = (root.winfo_screenwidth() - root.winfo_width()) // 2
+    y = (root.winfo_screenheight() - root.winfo_height()) // 3
+    root.geometry("+%d+%d" % (x, y))
+    root.lift()  # deliberately no focus_force: informational, not an alarm
+    root.mainloop()
+    return result["outcome"], max(0.0, deadline - time.monotonic())
+
+
 def wait(seconds):
-    """Pause the script for the given number of seconds."""
-    time.sleep(float(seconds))
+    """Pause the script for the given number of seconds.
+
+    Waits longer than WAIT_POPUP_MIN seconds show a topmost countdown
+    window with two buttons: "Skip wait" continues the script right away,
+    "Abort script" stops it (exit code 2).  Closing the window only
+    dismisses the display -- the remaining time is still waited out.
+    Shorter waits (and runs with no display) just sleep.
+    """
+    seconds = float(seconds)
+    if seconds <= WAIT_POPUP_MIN:
+        time.sleep(seconds)
+        return
+    try:
+        outcome, remaining = _wait_window(seconds)
+    except Exception:
+        time.sleep(seconds)
+        return
+    if outcome == "abort":
+        _emit("[%s] Script aborted by operator during wait" % time.strftime("%H:%M:%S"))
+        sys.exit(2)
+    if outcome == "skip":
+        _emit("[%s] Wait skipped by operator (%s remaining)"
+              % (time.strftime("%H:%M:%S"), _fmt_remaining(remaining)))
+        return
+    if outcome == "dismissed" and remaining > 0:
+        _emit("[%s] Wait display dismissed -- continuing to wait %s"
+              % (time.strftime("%H:%M:%S"), _fmt_remaining(remaining)))
+        time.sleep(remaining)
 
 
 def info(message):
