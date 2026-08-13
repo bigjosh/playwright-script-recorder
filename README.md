@@ -128,10 +128,15 @@ beeps loudly, and offers four choices:
 - **Skip and continue** — accept the mismatch and resume the script
 - **Stop the script** — abort immediately (exit code 2)
 
-A viewport-size mismatch at startup offers the same style of choices
-(**Check again** after resizing the window / **Continue anyway** /
-**Stop the script**). Unexpected errors show a plain **Acknowledge** alarm
-and exit. Closing an alarm window counts as its last (safest) button.
+A viewport-size mismatch at startup offers **Fix window size** — which
+resizes the browser through the debug connection until the viewport
+matches the recording exactly (Chrome updates and nudged windows shift it
+by a few pixels) — plus **Check again**, **Continue anyway**, and
+**Stop the script**. To pin the size unconditionally instead of asking,
+replace the script's `psl.checkViewport(w, h)` line with
+`psl.setViewport(w, h)`. Unexpected errors show a plain **Acknowledge**
+alarm and exit. Closing an alarm window counts as its last (safest)
+button.
 
 ## Notes
 

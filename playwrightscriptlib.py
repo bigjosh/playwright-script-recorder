@@ -856,13 +856,62 @@ def alarmOnError():
     sys.excepthook = _hook
 
 
+def setViewport(width, height):
+    """Resize the real browser window until the page viewport is exactly
+    width x height CSS pixels.
+
+    Works through the debug connection (no OS window fiddling), restoring
+    a maximized window to normal first when necessary.  Raises
+    RuntimeError when the size cannot be reached (screen too small,
+    below the browser's minimum window size, zoom is not 100%, ...).
+
+    Put psl.setViewport(w, h) at the start of a script to PIN the size it
+    was recorded at: Chrome updates and nudged windows change the
+    viewport by a few pixels, which shifts every recorded coordinate and
+    rescales every capture.
+    """
+    width, height = int(width), int(height)
+    page = _require_page()
+    session = page.context.new_cdp_session(page)
+    try:
+        target_info = session.send("Browser.getWindowForTarget")
+        window_id = target_info["windowId"]
+        if target_info["bounds"].get("windowState", "normal") != "normal":
+            session.send("Browser.setWindowBounds",
+                         {"windowId": window_id, "bounds": {"windowState": "normal"}})
+            time.sleep(0.3)
+        for _ in range(6):
+            vw, vh = viewportSize()
+            if (vw, vh) == (width, height):
+                break
+            bounds = session.send("Browser.getWindowBounds",
+                                  {"windowId": window_id})["bounds"]
+            session.send("Browser.setWindowBounds",
+                         {"windowId": window_id,
+                          "bounds": {"width": bounds["width"] + (width - vw),
+                                     "height": bounds["height"] + (height - vh)}})
+            time.sleep(0.3)
+        vw, vh = viewportSize()
+        if (vw, vh) != (width, height):
+            raise RuntimeError(
+                "Could not reach viewport %dx%d (got %dx%d) -- is the screen "
+                "large enough and zoom at 100%%?" % (width, height, vw, vh))
+        _emit("[%s] Viewport set to %dx%d" % (time.strftime("%H:%M:%S"), width, height))
+    finally:
+        try:
+            session.detach()
+        except Exception:
+            pass
+
+
 def checkViewport(width, height):
     """Alarm unless the live viewport matches the recorded size.
 
     Recorded coordinates only line up when the browser window (and zoom)
     match record time, so a size mismatch would silently click the wrong
-    places.  The alarm lets the operator resize the window and check
-    again, continue anyway, or stop the script (exit code 2).
+    places.  The alarm offers: Fix window size (resize the browser via
+    setViewport to match the recording), Check again, Continue anyway, or
+    Stop the script (exit code 2).
     """
     while True:
         w, h = viewportSize()
@@ -870,12 +919,20 @@ def checkViewport(width, height):
             return
         choice = alarm(
             "Viewport is %dx%d but this script was recorded at %dx%d. "
-            "Resize the browser window (and check zoom)." % (w, h, width, height),
-            buttons=("Check again", "Continue anyway", "Stop the script"))
+            "'Fix window size' resizes the browser to match (also check zoom)."
+            % (w, h, width, height),
+            buttons=("Fix window size", "Check again", "Continue anyway",
+                     "Stop the script"))
         if choice == 0:
-            info("Re-checking viewport...")
+            try:
+                setViewport(width, height)
+            except Exception as e:
+                _emit("[%s] Could not resize: %s" % (time.strftime("%H:%M:%S"), e))
             continue
         if choice == 1:
+            info("Re-checking viewport...")
+            continue
+        if choice == 2:
             info("Viewport mismatch ignored by operator")
             return
         info("Script stopped by operator")
