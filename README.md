@@ -70,6 +70,17 @@ blocks into a `.py` file. Captures still save PNGs (named
   replay: re-grab the same area and raise the alarm if it no longer
   matches the saved PNG. The `matchLevel` (default 0.98; lower = more
   tolerant) and the alarm message are prompted with sensible defaults.
+  The recorder also asks for a per-try `delay` (seconds, default 0) and a
+  number of `tries` (default 1); anything beyond the defaults is emitted
+  as `delay=` / `retrycount=` on the generated `psl.verifyFrame(...)` —
+  e.g. `delay=10, retrycount=90` turns a screen test into a poll that
+  succeeds the moment the screen matches, often nicer than a long fixed
+  `wait()` in front of it. Whenever a delay or retries are in play, a
+  quiet countdown window shows `Verifying frame / <name> / Try n of m in
+  Xs`, a live `(N seconds until timeout)` estimate, and the last
+  similarity score, with **Try now** / **Abort verify** (returns False,
+  script continues) / **Abort script** (exit code 2) buttons; closing it
+  hides the window and the cycle continues silently.
 - **Wait** — inserts a pause; useful before screen tests when the page or a
   remote-desktop stream needs time to settle.
 

@@ -28,6 +28,7 @@ viewport -- the same space frameGrab()/viewportGrab() screenshots are in.
 
 import io
 import os
+import re
 import sys
 import threading
 import time
@@ -473,7 +474,144 @@ def _save_diff_files(expected, actual, full=None, box=None):
     return paths
 
 
-def verifyFrame(baselinePath, box, matchLevel, message):
+class _VerifyPopup:
+    """Countdown window shown while verifyFrame() runs a delay/retry cycle.
+
+    Shows "Verifying frame / <name> / Try n of m in Xs" plus the last
+    similarity score.  Buttons: "Try now" skips the current countdown,
+    "Abort verify" gives up on this screen test (verifyFrame returns
+    False), "Abort script" exits with code 2.  Closing the window hides
+    it and the verify continues silently.
+    """
+
+    def __init__(self, name):
+        import tkinter as tk
+
+        self.action = None
+        self.hidden = False
+        self._timer = None
+        bg = "#0f5b5b"
+        root = self.root = tk.Tk()
+        root.title("Verifying frame")
+        root.configure(bg=bg)
+        root.attributes("-topmost", True)
+        tk.Label(root, text="Verifying frame", font=("Segoe UI", 16, "bold"),
+                 fg="white", bg=bg).pack(padx=40, pady=(18, 2))
+        tk.Label(root, text=name, font=("Segoe UI", 24, "bold"),
+                 fg="#9fe8e8", bg=bg).pack(padx=40, pady=2)
+        self._status = tk.Label(root, text="", font=("Segoe UI", 15),
+                                fg="white", bg=bg)
+        self._status.pack(padx=40, pady=4)
+        self._timeout = tk.Label(root, text="", font=("Segoe UI", 11),
+                                 fg="#cfe8e8", bg=bg)
+        self._timeout.pack(padx=40, pady=0)
+        self._score = tk.Label(root, text="", font=("Segoe UI", 11),
+                               fg="#cfe8e8", bg=bg)
+        self._score.pack(padx=40, pady=(0, 6))
+        row = tk.Frame(root, bg=bg)
+        row.pack(padx=30, pady=(4, 18))
+        for label, action in (("Try now", "trynow"),
+                              ("Abort verify", "abortverify"),
+                              ("Abort script", "abortscript")):
+            tk.Button(row, text=label, font=("Segoe UI", 11, "bold"),
+                      command=lambda a=action: self._pick(a),
+                      padx=12, pady=6).pack(side="left", padx=6)
+        root.protocol("WM_DELETE_WINDOW", self._hide)
+        root.update_idletasks()
+        x = (root.winfo_screenwidth() - root.winfo_width()) // 2
+        y = (root.winfo_screenheight() - root.winfo_height()) // 3
+        root.geometry("+%d+%d" % (x, y))
+        root.lift()  # informational: no focus stealing
+
+    def _pick(self, action):
+        self.action = action
+        self._cancel_timer()
+        self.root.quit()
+
+    def _hide(self):
+        self.hidden = True
+        self._cancel_timer()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        _emit("[%s] Verify window hidden -- continuing silently"
+              % time.strftime("%H:%M:%S"))
+
+    def _cancel_timer(self):
+        if self._timer is not None:
+            try:
+                self.root.after_cancel(self._timer)
+            except Exception:
+                pass
+            self._timer = None
+
+    def countdown(self, seconds, attempt, total):
+        """Pump the window for `seconds` before attempt n of m.  Returns
+        'trynow', 'abortverify', 'abortscript', or None (time elapsed)."""
+        deadline = time.monotonic() + max(0.0, seconds)
+        if self.hidden:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+            return None
+
+        def tick():
+            self._timer = None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.root.quit()
+                return
+            self._status.config(text="Try %d of %d in %s"
+                                % (attempt, total, _fmt_remaining(remaining)))
+            until_timeout = remaining + (total - attempt) * seconds
+            self._timeout.config(text="(%d seconds until timeout)"
+                                 % int(until_timeout + 0.999))
+            self._timer = self.root.after(150, tick)
+
+        try:
+            self._status.config(text="Try %d of %d" % (attempt, total))
+            self._timer = self.root.after(0, tick)
+            self.root.mainloop()
+        except Exception:
+            self.hidden = True
+        self._cancel_timer()
+        action = self.action
+        self.action = None
+        if self.hidden and action is None:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+        return action
+
+    def note_grab(self, attempt, total):
+        if self.hidden:
+            return
+        try:
+            self._status.config(text="Try %d of %d -- checking..." % (attempt, total))
+            self.root.update()
+        except Exception:
+            self.hidden = True
+
+    def note_score(self, text):
+        if self.hidden:
+            return
+        try:
+            self._score.config(text=text)
+        except Exception:
+            self.hidden = True
+
+    def close(self):
+        self._cancel_timer()
+        if not self.hidden:
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+        self.hidden = True
+
+
+def verifyFrame(baselinePath, box, matchLevel, message, delay=0, retrycount=0):
     """Compare the live screen region against a saved capture PNG.
 
     box is (x1, y1, x2, y2) -- the region the capture was taken from.  On a
@@ -489,20 +627,83 @@ def verifyFrame(baselinePath, box, matchLevel, message):
       3. Skip and continue -- accept the mismatch and resume the script
       4. Stop the script   -- abort immediately (exit code 2)
 
+    delay is seconds to sleep before each grab (0 = grab immediately);
+    retrycount is how many tries before raising the alarm (0 and 1 both
+    mean a single try).  With e.g. delay=10, retrycount=90 a screen test
+    becomes a poll: check every 10 seconds and only alarm if the screen
+    never matched within ~15 minutes -- usually better than a long fixed
+    wait().  Whenever a delay or retries are in play, a quiet countdown
+    window shows "Verifying frame / <name> / Try n of m in Xs" with the
+    last similarity score and three buttons: "Try now" (skip the current
+    countdown), "Abort verify" (give up on this test; returns False), and
+    "Abort script" (exit code 2); closing the window hides it and the
+    cycle continues silently.  Instant single-try verifies show no
+    window.  A match on a later attempt logs which attempt succeeded, and
+    the give-up alarm reports the try count.  The operator's "Try compare
+    again" button reruns the whole cycle.
+
     Returns True when the frames matched (possibly after retries), False
     when the operator chose to skip.
     """
     if not 0.0 <= matchLevel <= 1.0:
         raise ValueError("matchLevel must be between 0.0 and 1.0")
+    delay = max(0.0, float(delay))
+    attempts = max(1, int(retrycount))
     baseline = loadFrame(baselinePath)
     x1, y1, x2, y2 = box
+    region = (x1, y1, x2, y2)
+    base_name = os.path.basename(str(baselinePath))
+    name_match = re.match(
+        r"^capture-.+-([A-Za-z_][A-Za-z0-9_]*)-\d+,\d+,\d+,\d+\.png$", base_name)
+    display_name = name_match.group(1) if name_match else base_name
     while True:
-        fresh, full = _frame_and_full(x1, y1, x2, y2)
-        score = frameSimilarity(baseline, fresh)
-        if score >= matchLevel:
+        popup = None
+        if delay > 0 or attempts > 1:
+            try:
+                popup = _VerifyPopup(display_name)
+            except Exception:
+                popup = None
+        outcome = None
+        try:
+            for attempt in range(1, attempts + 1):
+                action = None
+                if popup is not None:
+                    action = popup.countdown(delay, attempt, attempts)
+                elif delay:
+                    time.sleep(delay)
+                if action in ("abortverify", "abortscript"):
+                    outcome = action
+                    break
+                if popup is not None:
+                    popup.note_grab(attempt, attempts)
+                fresh, full = _frame_and_full(x1, y1, x2, y2)
+                score = frameSimilarity(baseline, fresh)
+                if score >= matchLevel:
+                    if attempt > 1:
+                        _emit("[%s] Screen test matched on attempt %d/%d (similarity %.4f)"
+                              % (time.strftime("%H:%M:%S"), attempt, attempts, score))
+                    outcome = True
+                    break
+                if popup is not None:
+                    popup.note_score("last similarity %.4f (needs at least %s)"
+                                     % (score, matchLevel))
+        finally:
+            if popup is not None:
+                popup.close()
+        if outcome is True:
             return True
-        detail = "%s  (similarity %.4f, needs at least %s)" % (message, score, matchLevel)
-        region = (x1, y1, x2, y2)
+        if outcome == "abortverify":
+            _emit("[%s] Verify aborted by operator -- continuing"
+                  % time.strftime("%H:%M:%S"))
+            return False
+        if outcome == "abortscript":
+            _emit("[%s] Script stopped by operator" % time.strftime("%H:%M:%S"))
+            sys.exit(2)
+        if attempts > 1:
+            detail = ("%s  (similarity %.4f after %d tries, needs at least %s)"
+                      % (message, score, attempts, matchLevel))
+        else:
+            detail = "%s  (similarity %.4f, needs at least %s)" % (message, score, matchLevel)
         while True:
             choice = alarm(detail, buttons=("Try compare again", "Show differences",
                                             "Skip and continue", "Stop the script"))

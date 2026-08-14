@@ -293,6 +293,23 @@ def do_screen_test(writer, script_base, script_dir):
         print("Enter a number between 0.0 and 1.0.")
     message = input("Alarm message [Screen does not match %s]: " % name).strip() \
         or "Screen does not match %s" % name
+    while True:
+        s = input("Delay before each try, seconds [0]: ").strip() or "0"
+        try:
+            vdelay = float(s)
+        except ValueError:
+            vdelay = -1.0
+        if vdelay >= 0:
+            break
+        print("Enter zero or a positive number.")
+    if vdelay == int(vdelay):
+        vdelay = int(vdelay)
+    while True:
+        s = input("Tries before alarming [1]: ").strip() or "1"
+        if s.isdigit() and int(s) >= 1:
+            vretry = int(s)
+            break
+        print("Enter a whole number, 1 or more.")
 
     # the saved baseline is the exact crop of the screenshot the user picked on
     for old_fn, _, _, _ in list_captures(script_dir, script_base, name):
@@ -300,10 +317,19 @@ def do_screen_test(writer, script_base, script_dir):
     png_name = capture_filename(script_base, name, box)
     img.crop(box).save(os.path.join(script_dir, png_name))
 
-    writer.action(comment,
-                  "Screen test '%s' (matchLevel %s)" % (name, level),
-                  "psl.verifyFrame(%r, (%d, %d, %d, %d), %s, %r)"
-                  % (png_name, x1, y1, x2, y2, level, message))
+    if vdelay > 0 or vretry > 1:
+        info_text = ("Screen test '%s' (matchLevel %s, delay %ss, %d tries)"
+                     % (name, level, vdelay, vretry))
+    else:
+        info_text = "Screen test '%s' (matchLevel %s)" % (name, level)
+    extra = ""
+    if vdelay > 0:
+        extra += ", delay=%s" % vdelay
+    if vretry > 1:
+        extra += ", retrycount=%d" % vretry
+    writer.action(comment, info_text,
+                  "psl.verifyFrame(%r, (%d, %d, %d, %d), %s, %r%s)"
+                  % (png_name, x1, y1, x2, y2, level, message, extra))
     print("Screen test '%s' recorded; baseline saved to %s"
           % (name, os.path.join(script_dir, png_name)))
 
