@@ -9,3 +9,4 @@ capture-*.png
 compare-diff-*.png
 *.log
 screenshots/
+shots/

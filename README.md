@@ -104,11 +104,12 @@ after every click and double click — useful when the target UI needs a
 beat to react between actions. `0` (the default) turns it off.
 
 `psl.screenshotOnInfo(True)` saves a full screenshot on every info line —
-a visual flight recorder for unattended runs. PNGs go to a `screenshots/`
-folder next to the script (override with
-`psl.screenshotOnInfo(True, folder=...)`), named
-`yymmdd hhmmss-<info message>.png`. Info lines before the browser is
-connected are skipped; mind the disk on long runs at big viewports.
+a visual flight recorder for unattended runs. PNGs go to
+`shots/<yymmdd hhmmss>/` next to the script — stamped with the time the
+call was made, so every run gets its own folder (override with
+`psl.screenshotOnInfo(True, folder=...)` for a fixed location). Files are
+named `yymmdd hhmmss-<info message>.png`. Info lines before the browser
+is connected are skipped; mind the disk on long runs at big viewports.
 
 While running, the script prints a timestamped line before every step,
 including your recorded comment:

@@ -640,20 +640,25 @@ def info(message):
         _step_pause(message)
 
 
-def screenshotOnInfo(enabled, folder="screenshots"):
+def screenshotOnInfo(enabled, folder=None):
     """Save a full screenshot of the viewport on every info() call.
 
-    PNGs go to <folder> (created if needed; a relative path resolves next
-    to the running script), named "yymmdd hhmmss-<info message>.png" --
-    a visual flight recorder of the whole run.  Info lines that happen
-    before the browser is connected are skipped quietly.  Mind the disk:
-    a long run at a big viewport adds up fast.
+    By default PNGs go to shots\\<yymmdd hhmmss>\\ next to the running
+    script, stamped with the moment screenshotOnInfo(True) was called --
+    one folder per run.  Pass folder=... to use a fixed location instead
+    (created if needed; a relative path resolves next to the script).
+    Files are named "yymmdd hhmmss-<info message>.png" -- a visual flight
+    recorder of the whole run.  Info lines that happen before the browser
+    is connected are skipped quietly.  Mind the disk: a long run at a big
+    viewport adds up fast.
     """
     global _shot_dir, _shot_warned
     if not enabled:
         _shot_dir = None
         _emit("[%s] Info screenshots off" % time.strftime("%H:%M:%S"))
         return
+    if folder is None:
+        folder = os.path.join("shots", time.strftime("%y%m%d %H%M%S"))
     if not os.path.isabs(folder):
         base = sys.argv[0] if sys.argv and sys.argv[0] else "."
         folder = os.path.join(os.path.dirname(os.path.abspath(base)), folder)
