@@ -54,6 +54,22 @@ _pause_on_info = False
 _clicks_settle_time = 0.0
 _shot_dir = None
 _shot_warned = False
+_run_dir = None
+
+
+def _run_folder():
+    """runs\\<yymmdd hhmmss>\\ next to the running script.
+
+    Created on first use and then shared for the rest of the run, so the
+    log file and the info screenshots of one run land in one folder.
+    """
+    global _run_dir
+    if _run_dir is None:
+        base = sys.argv[0] if sys.argv and sys.argv[0] else "."
+        _run_dir = os.path.join(os.path.dirname(os.path.abspath(base)),
+                                "runs", time.strftime("%y%m%d %H%M%S"))
+        os.makedirs(_run_dir, exist_ok=True)
+    return _run_dir
 
 
 def _log_write(text):
@@ -327,6 +343,127 @@ def compareFrames(img1, img2, matchLevel):
     return frameSimilarity(img1, img2) >= matchLevel
 
 
+def _pixel_inspector(parent, expected, actual):
+    """Zoomable side-by-side pixel view opened from the diff viewer.
+
+    Shows both frames blown up with nearest-neighbour pixels (grid lines
+    from 8x), scrolling in sync.  Clicking a pixel on either side
+    highlights the same location on both and reports the two RGB values
+    and their max channel difference.  Returns the Toplevel window.
+    """
+    import tkinter as tk
+    from PIL import ImageTk
+
+    expected = expected.convert("RGB")
+    actual = actual.convert("RGB")
+    if actual.size != expected.size:
+        actual = actual.resize(expected.size, Image.LANCZOS)
+    w, h = expected.size
+
+    top = tk.Toplevel(parent)
+    top.title("Pixel inspector")
+    top.attributes("-topmost", True)
+
+    state = {"zoom": max(1, min(32, 480 // max(w, 1), 320 // max(h, 1))),
+             "sel": None}
+    photos = {}
+
+    info = tk.Label(top, text="Click a pixel to inspect it",
+                    font=("Consolas", 10))
+    info.pack(padx=10, pady=(10, 2))
+
+    grid_frame = tk.Frame(top)
+    grid_frame.pack(padx=10, pady=4)
+    tk.Label(grid_frame, text="Expected (saved capture)",
+             font=("Segoe UI", 10)).grid(row=0, column=0)
+    tk.Label(grid_frame, text="Actual (screen now)",
+             font=("Segoe UI", 10)).grid(row=0, column=1)
+    c_exp = tk.Canvas(grid_frame, highlightthickness=1,
+                      highlightbackground="#888888")
+    c_act = tk.Canvas(grid_frame, highlightthickness=1,
+                      highlightbackground="#888888")
+    c_exp.grid(row=1, column=0, padx=(0, 6))
+    c_act.grid(row=1, column=1, padx=(6, 0))
+    ys = tk.Scrollbar(grid_frame, orient="vertical",
+                      command=lambda *a: (c_exp.yview(*a), c_act.yview(*a)))
+    ys.grid(row=1, column=2, sticky="ns")
+    xs = tk.Scrollbar(grid_frame, orient="horizontal",
+                      command=lambda *a: (c_exp.xview(*a), c_act.xview(*a)))
+    xs.grid(row=2, column=0, columnspan=2, sticky="ew")
+    c_exp.config(yscrollcommand=ys.set, xscrollcommand=xs.set)
+    c_act.config(yscrollcommand=ys.set, xscrollcommand=xs.set)
+
+    def draw_sel():
+        z = state["zoom"]
+        for canvas in (c_exp, c_act):
+            canvas.delete("sel")
+        if state["sel"] is None:
+            return
+        px, py = state["sel"]
+        for canvas in (c_exp, c_act):
+            canvas.create_rectangle(px * z, py * z, (px + 1) * z, (py + 1) * z,
+                                    outline="#ffee00", width=2, tags="sel")
+
+    def redraw():
+        z = state["zoom"]
+        zw, zh = w * z, h * z
+        photos["exp"] = ImageTk.PhotoImage(
+            expected.resize((zw, zh), Image.NEAREST), master=top)
+        photos["act"] = ImageTk.PhotoImage(
+            actual.resize((zw, zh), Image.NEAREST), master=top)
+        for canvas, key in ((c_exp, "exp"), (c_act, "act")):
+            canvas.delete("all")
+            canvas.create_image(0, 0, image=photos[key], anchor="nw")
+            if z >= 8:
+                for gx in range(0, zw + 1, z):
+                    canvas.create_line(gx, 0, gx, zh, fill="#666666")
+                for gy in range(0, zh + 1, z):
+                    canvas.create_line(0, gy, zw, gy, fill="#666666")
+            canvas.config(scrollregion=(0, 0, zw, zh),
+                          width=min(zw, 430), height=min(zh, 320))
+        draw_sel()
+        zoom_label.config(text="zoom %dx" % z)
+
+    def on_click(event, canvas):
+        z = state["zoom"]
+        px = int(canvas.canvasx(event.x) // z)
+        py = int(canvas.canvasy(event.y) // z)
+        if not (0 <= px < w and 0 <= py < h):
+            return
+        state["sel"] = (px, py)
+        e_rgb = expected.getpixel((px, py))
+        a_rgb = actual.getpixel((px, py))
+        diff = max(abs(e_rgb[i] - a_rgb[i]) for i in range(3))
+        info.config(text="Pixel (%d, %d)   expected RGB %s   actual RGB %s   "
+                         "max channel diff %d" % (px, py, e_rgb, a_rgb, diff))
+        draw_sel()
+
+    c_exp.bind("<Button-1>", lambda ev: on_click(ev, c_exp))
+    c_act.bind("<Button-1>", lambda ev: on_click(ev, c_act))
+
+    def set_zoom(direction):
+        z = state["zoom"]
+        nz = min(64, z * 2) if direction > 0 else max(1, z // 2)
+        if nz != z:
+            state["zoom"] = nz
+            redraw()
+
+    controls = tk.Frame(top)
+    controls.pack(pady=(4, 10))
+    tk.Button(controls, text="Zoom in", font=("Segoe UI", 10, "bold"),
+              command=lambda: set_zoom(1), padx=10).pack(side="left", padx=4)
+    tk.Button(controls, text="Zoom out", font=("Segoe UI", 10, "bold"),
+              command=lambda: set_zoom(-1), padx=10).pack(side="left", padx=4)
+    zoom_label = tk.Label(controls, text="", font=("Segoe UI", 10))
+    zoom_label.pack(side="left", padx=8)
+    tk.Button(controls, text="Close", font=("Segoe UI", 10, "bold"),
+              command=top.destroy, padx=14).pack(side="left", padx=4)
+
+    redraw()
+    top.lift()
+    return top
+
+
 def _diff_viewer(expected, actual, score, matchLevel, box=None, full=None):
     """Side-by-side window: saved capture vs current screen, with a toggle
     that tints the differing areas red.  When box and full are given, a
@@ -432,8 +569,22 @@ def _diff_viewer(expected, actual, score, matchLevel, box=None, full=None):
         tk.Button(top, text="Close", font=("Segoe UI", 11, "bold"),
                   command=top.destroy, padx=16, pady=4).pack(pady=(4, 10))
 
+    pixels = {"win": None}
+
+    def open_pixels():
+        try:
+            if pixels["win"] is not None and pixels["win"].winfo_exists():
+                pixels["win"].lift()
+                pixels["win"].focus_force()
+                return
+        except Exception:
+            pass
+        pixels["win"] = _pixel_inspector(root, expected, actual)
+
     tk.Checkbutton(root, text="Highlight differences (red)", variable=highlight_on,
                    command=refresh, font=("Segoe UI", 11)).pack(pady=4)
+    tk.Button(root, text="View pixels", font=("Segoe UI", 11),
+              command=open_pixels, padx=12, pady=4).pack(pady=4)
     if full is not None and box is not None:
         tk.Button(root, text="Show current capture inside full frame grab",
                   font=("Segoe UI", 11), command=open_context,
@@ -844,14 +995,15 @@ def info(message):
 def screenshotOnInfo(enabled, folder=None):
     """Save a full screenshot of the viewport on every info() call.
 
-    By default PNGs go to shots\\<yymmdd hhmmss>\\ next to the running
-    script, stamped with the moment screenshotOnInfo(True) was called --
-    one folder per run.  Pass folder=... to use a fixed location instead
-    (created if needed; a relative path resolves next to the script).
-    Files are named "yymmdd hhmmss-<info message>.png" -- a visual flight
-    recorder of the whole run.  Info lines that happen before the browser
-    is connected are skipped quietly.  Mind the disk: a long run at a big
-    viewport adds up fast.
+    By default PNGs go to this run's runs\\<yymmdd hhmmss>\\ folder
+    (created next to the running script and shared with logging, so one
+    run's log and screenshots stay together).  Pass folder=... to use a
+    fixed location instead (created if needed; a relative path resolves
+    next to the script).  Files are named
+    "yymmdd hhmmss-<info message>.png" -- a visual flight recorder of the
+    whole run.  Info lines that happen before the browser is connected
+    are skipped quietly.  Mind the disk: a long run at a big viewport
+    adds up fast.
     """
     global _shot_dir, _shot_warned
     if not enabled:
@@ -859,7 +1011,7 @@ def screenshotOnInfo(enabled, folder=None):
         _emit("[%s] Info screenshots off" % time.strftime("%H:%M:%S"))
         return
     if folder is None:
-        folder = os.path.join("shots", time.strftime("%y%m%d %H%M%S"))
+        folder = _run_folder()
     if not os.path.isabs(folder):
         base = sys.argv[0] if sys.argv and sys.argv[0] else "."
         folder = os.path.join(os.path.dirname(os.path.abspath(base)), folder)
@@ -982,10 +1134,12 @@ def _pause_console(message, buttons):
 def logging(enabled, path=None):
     """Append every output line this library prints to a log file.
 
-    psl.logging(True) opens <scriptname>.log next to the running script in
-    append mode (each run adds a dated session header) and mirrors info()
-    lines, alarm lines, operator answers and error tracebacks into it.
-    psl.logging(False) turns it off.  path overrides the file location.
+    psl.logging(True) writes <scriptname>.log into this run's
+    runs\\<yymmdd hhmmss>\\ folder (created next to the running script and
+    shared with screenshotOnInfo, so one run's log and screenshots stay
+    together) and mirrors info() lines, alarm lines, operator answers and
+    error tracebacks into it.  psl.logging(False) turns it off.  path
+    overrides the file location (opened in append mode either way).
     """
     global _log
     if _log is not None:
@@ -998,7 +1152,8 @@ def logging(enabled, path=None):
         return
     if path is None:
         base = sys.argv[0] if sys.argv and sys.argv[0] else "playwrightscript"
-        path = os.path.splitext(os.path.abspath(base))[0] + ".log"
+        path = os.path.join(_run_folder(),
+                            os.path.splitext(os.path.basename(base))[0] + ".log")
     _log = open(path, "a", encoding="utf-8")
     _log.write("===== %s -- log opened by %s =====\n"
                % (time.strftime("%Y-%m-%d %H:%M:%S"),

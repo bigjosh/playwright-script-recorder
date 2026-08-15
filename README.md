@@ -41,8 +41,8 @@ python playwrightscriptrecord.py
 ```
 
 It asks for a script filename, whether replays should log their output to
-`<scriptname>.log` (default yes — emits `psl.logging(True)` into the
-script), and the debug URL (`http://127.0.0.1:9222` is the best answer —
+`runs\<datetime>\<scriptname>.log` (default yes — emits `psl.logging(True)`
+into the script), and the debug URL (`http://127.0.0.1:9222` is the best answer —
 the `ws://` form also works but changes every Chrome restart). If several
 tabs are open, it also asks which one the script should drive. Then a menu loops: Click, Double Click, Send Keys, Screen
 Test, Wait, End. Every action is performed live in the browser as it is
@@ -95,8 +95,11 @@ The optional argument overrides the debug URL recorded in the script.
 
 If logging was enabled at record time (`psl.logging(True)` in the script),
 every printed line — steps, alarms, operator answers, error tracebacks —
-is also appended to `<scriptname>.log` next to the script; each run starts
-with a dated header, so the log accumulates a history across runs.
+is also written to `runs/<yymmdd hhmmss>/<scriptname>.log`: the dated run
+folder is created next to the script when logging (or info screenshots)
+first switches on, and both features share it, so everything from one run
+lands in one place. Pass `psl.logging(True, path=...)` for a fixed file
+instead (appended across runs with dated session headers).
 
 To single-step a script, add `psl.pauseOnInfo(True)` (right after the
 header, or just before a section you want to debug): every info line then
@@ -115,9 +118,8 @@ after every click and double click — useful when the target UI needs a
 beat to react between actions. `0` (the default) turns it off.
 
 `psl.screenshotOnInfo(True)` saves a full screenshot on every info line —
-a visual flight recorder for unattended runs. PNGs go to
-`shots/<yymmdd hhmmss>/` next to the script — stamped with the time the
-call was made, so every run gets its own folder (override with
+a visual flight recorder for unattended runs. PNGs go into the same
+per-run `runs/<yymmdd hhmmss>/` folder as the log (override with
 `psl.screenshotOnInfo(True, folder=...)` for a fixed location). Files are
 named `yymmdd hhmmss-<info message>.png`. Info lines before the browser
 is connected are skipped; mind the disk on long runs at big viewports.
@@ -137,7 +139,12 @@ beeps loudly, and offers four choices:
   into the right state
 - **Show differences** — opens the saved capture and the current screen side
   by side, with the areas the comparator considers different tinted red
-  (toggleable), then returns to the alarm. A further button, **Show current
+  (toggleable), then returns to the alarm. A **View pixels** button opens a
+  zoomable side-by-side pixel inspector (nearest-neighbour blocks with grid
+  lines, synced scrolling): click a pixel on either side to highlight the
+  same spot on both and see the two RGB values with their max channel
+  difference — ideal when a tiny capture fails and the difference is
+  invisible at 1:1. A further button, **Show current
   capture inside full frame grab**, displays the whole viewport as the
   script sees it with a blinking red box around the compare region — handy
   when the grabbed region isn't where (or what) you thought, e.g. the

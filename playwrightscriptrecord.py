@@ -374,7 +374,8 @@ def main():
         script_dir = os.path.dirname(script_path)
         script_base = os.path.splitext(os.path.basename(script_path))[0]
 
-    log_display = ("%s.log" % script_base) if fname is not None else "<scriptname>.log"
+    log_display = ("runs\\<datetime>\\%s.log" % script_base) if fname is not None \
+        else "runs\\<datetime>\\<scriptname>.log"
     want_log = input("Log output to %s when the script runs? [Y/n]: "
                      % log_display).strip().lower() != "n"
 

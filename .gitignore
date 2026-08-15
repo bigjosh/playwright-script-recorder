@@ -10,3 +10,4 @@ compare-diff-*.png
 *.log
 screenshots/
 shots/
+runs/
