@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 from PIL import Image
 
 import playwrightscriptlib as psl
+import playwrightscriptlayout as layouts
 
 MENU = """
 What should we do next?
@@ -129,106 +130,38 @@ class ConsoleWriter(_WriterBase):
 
     def finish(self):
         _WriterBase.finish(self)
-        print("\nImmediate mode: nothing was saved.")
+        print("\nImmediate mode: no script file was saved.")
 
 
-def _run_picker(img, title, mode):
-    """Show img fitted to the local screen and let the user pick on it.
-
-    mode "point" returns (x, y) on click; mode "rect" returns
-    (x1, y1, x2, y2) after a click-drag.  Coordinates are in page space
-    (CSS pixels).  Esc or closing the window cancels and returns None.
-    """
-    import tkinter as tk
-    from PIL import ImageTk
-
-    root = tk.Tk()
-    root.title(title)
-    root.attributes("-topmost", True)
-    root.resizable(False, False)
-
-    scale = min(1.0,
-                0.9 * root.winfo_screenwidth() / img.width,
-                0.85 * root.winfo_screenheight() / img.height)
-    if scale < 1.0:
-        disp = img.resize((max(1, int(img.width * scale)),
-                           max(1, int(img.height * scale))), Image.LANCZOS)
-    else:
-        disp = img
-
-    instructions = ("Click the target spot.  Esc cancels."
-                    if mode == "point" else
-                    "Drag a rectangle around the region.  Esc cancels.")
-    status = tk.Label(root, text=instructions, font=("Segoe UI", 11), anchor="w")
-    status.pack(fill="x", padx=6, pady=3)
-
-    photo = ImageTk.PhotoImage(disp)
-    canvas = tk.Canvas(root, width=disp.width, height=disp.height,
-                       highlightthickness=0, cursor="crosshair")
-    canvas.pack()
-    canvas.create_image(0, 0, image=photo, anchor="nw")
-
-    result = {}
-    drag = {}
-
-    def to_page(cx, cy):
-        x = min(max(int(round(cx / scale)), 0), img.width - 1)
-        y = min(max(int(round(cy / scale)), 0), img.height - 1)
-        return x, y
-
-    def on_motion(event):
-        x, y = to_page(event.x, event.y)
-        canvas.delete("cross")
-        canvas.create_line(event.x, 0, event.x, disp.height,
-                           fill="#ff3333", tags="cross")
-        canvas.create_line(0, event.y, disp.width, event.y,
-                           fill="#ff3333", tags="cross")
-        status.config(text="%s   (x=%d, y=%d)" % (instructions, x, y))
-        if mode == "rect" and "start" in drag:
-            canvas.delete("band")
-            canvas.create_rectangle(drag["cx"], drag["cy"], event.x, event.y,
-                                    outline="#00ccff", width=2, tags="band")
-
-    def on_press(event):
-        if mode == "point":
-            result["value"] = to_page(event.x, event.y)
-            root.destroy()
-        else:
-            drag["start"] = to_page(event.x, event.y)
-            drag["cx"], drag["cy"] = event.x, event.y
-
-    def on_release(event):
-        if mode != "rect" or "start" not in drag:
-            return
-        x1, y1 = drag.pop("start")
-        x2, y2 = to_page(event.x, event.y)
-        x1, x2 = sorted((x1, x2))
-        y1, y2 = sorted((y1, y2))
-        if x2 - x1 < 3 or y2 - y1 < 3:
-            status.config(text="Rectangle too small -- drag again.  Esc cancels.")
-            canvas.delete("band")
-            return
-        result["value"] = (x1, y1, x2, y2)
-        root.destroy()
-
-    canvas.bind("<Motion>", on_motion)
-    canvas.bind("<Button-1>", on_press)
-    canvas.bind("<ButtonRelease-1>", on_release)
-    root.bind("<Escape>", lambda e: root.destroy())
-    root.protocol("WM_DELETE_WINDOW", root.destroy)
-    root.lift()
-    root.focus_force()
-    root.mainloop()
-    return result.get("value")
+# Recording and on-demand layout definition share the same frozen-image picker.
+_run_picker = layouts.pick_on_image
 
 
 def ask_comment():
     return input("Optional comment (Enter for none): ").strip()
 
 
-def do_click(writer, double):
+def ask_layout_name(label):
+    while True:
+        name = input("Name for this %s (letters, digits, underscore, hyphen): " % label).strip()
+        try:
+            return layouts.validate_name(name)
+        except layouts.LayoutError as exc:
+            print(exc)
+
+
+def do_click(writer, double, named=False):
     label = "Double click" if double else "Click"
     comment = ask_comment()
+    if named:
+        name = ask_layout_name("click location")
+        psl.definePoint(name)
+        action = psl.doubleClick if double else psl.click
+        action(name)
+        writer.action(comment, "%s '%s'" % (label, name),
+                      "psl.%s(%r)" % ("doubleClick" if double else "click", name))
+        print("%s performed and recorded using layout point '%s'." % (label, name))
+        return
     print("Taking screenshot -- pick the %s position..." % label.lower())
     img = psl.viewportGrab()
     point = _run_picker(img, "%s -- pick the position" % label, "point")
@@ -260,26 +193,30 @@ def do_sendkeys(writer):
     print("Keys sent and recorded.")
 
 
-def do_screen_test(writer, script_base, script_dir):
+def do_screen_test(writer, script_base, script_dir, named=False):
     comment = ask_comment()
-    while True:
-        name = input("Name for this screen test (letters, digits, underscore): ").strip()
-        if not name:
-            continue
-        if not name.isidentifier() or keyword.iskeyword(name) or name.startswith("_"):
-            print("Please use letters/digits/underscore, not starting with a digit or underscore.")
-            continue
-        if list_captures(script_dir, script_base, name) and input(
-                "Screen test '%s' already has a capture -- replace it? [y/N]: "
-                % name).strip().lower() != "y":
-            continue
-        break
-    print("Taking screenshot -- drag a rectangle around the area to test...")
-    img = psl.viewportGrab()
-    box = _run_picker(img, "Screen test '%s' -- drag the area" % name, "rect")
-    if box is None:
-        print("Cancelled -- nothing recorded.")
-        return
+    if named:
+        name = ask_layout_name("expected screen state")
+        png_name, box = psl.defineFrame(name)
+    else:
+        while True:
+            name = input("Name for this screen test (letters, digits, underscore): ").strip()
+            if not name:
+                continue
+            if not name.isidentifier() or keyword.iskeyword(name) or name.startswith("_"):
+                print("Please use letters/digits/underscore, not starting with a digit or underscore.")
+                continue
+            if list_captures(script_dir, script_base, name) and input(
+                    "Screen test '%s' already has a capture -- replace it? [y/N]: "
+                    % name).strip().lower() != "y":
+                continue
+            break
+        print("Taking screenshot -- drag a rectangle around the area to test...")
+        img = psl.viewportGrab()
+        box = _run_picker(img, "Screen test '%s' -- drag the area" % name, "rect")
+        if box is None:
+            print("Cancelled -- nothing recorded.")
+            return
     x1, y1, x2, y2 = box
 
     while True:
@@ -311,12 +248,16 @@ def do_screen_test(writer, script_base, script_dir):
             break
         print("Enter a whole number, 1 or more.")
 
-    # the saved baseline is the exact crop of the screenshot the user picked on
-    for old_fn, _, _, _ in list_captures(script_dir, script_base, name):
-        os.remove(os.path.join(script_dir, old_fn))
-    png_name = capture_filename(script_base, name, box)
-    img.crop(box).save(os.path.join(script_dir, png_name))
+    if not named:
+        # the saved baseline is the exact crop of the screenshot the user picked on
+        for old_fn, _, _, _ in list_captures(script_dir, script_base, name):
+            os.remove(os.path.join(script_dir, old_fn))
+        png_name = capture_filename(script_base, name, box)
+        img.crop(box).save(os.path.join(script_dir, png_name))
 
+    # fallthru is deliberately not prompted for: the recorder always emits the
+    # default (alarm on mismatch); add fallthru=True by hand where a script
+    # should branch on the result instead
     if vdelay > 0 or vretry > 1:
         info_text = ("Screen test '%s' (matchLevel %s, delay %ss, %d tries)"
                      % (name, level, vdelay, vretry))
@@ -327,9 +268,12 @@ def do_screen_test(writer, script_base, script_dir):
         extra += ", delay=%s" % vdelay
     if vretry > 1:
         extra += ", retrycount=%d" % vretry
-    writer.action(comment, info_text,
-                  "psl.verifyFrame(%r, (%d, %d, %d, %d), %s, %r%s)"
-                  % (png_name, x1, y1, x2, y2, level, message, extra))
+    if named:
+        code = "psl.verifyFrame(%r, matchLevel=%s, message=%r%s)" % (name, level, message, extra)
+    else:
+        code = "psl.verifyFrame(%r, (%d, %d, %d, %d), %s, %r%s)" % (
+            png_name, x1, y1, x2, y2, level, message, extra)
+    writer.action(comment, info_text, code)
     print("Screen test '%s' recorded; baseline saved to %s"
           % (name, os.path.join(script_dir, png_name)))
 
@@ -412,11 +356,15 @@ def main():
     hint = urlparse(page_url).netloc or page_url
     vw, vh = psl.viewportSize()
     print("\nRecording against: %s  (viewport %dx%d)" % (page_url[:90], vw, vh))
+    named = input("Use named screen layouts? [Y/n]: ").strip().lower() != "n"
+    if named:
+        psl.loadLayout()
+        psl.checkViewport()
 
     if fname is None:
         writer = ConsoleWriter()
         print("Immediate mode: each action runs right away and its code block "
-              "prints below; nothing is saved.")
+              "prints below; no script file is saved.")
     else:
         writer = ScriptWriter(fname)
         print("Writing to %s (saved after every step)." % fname)
@@ -435,8 +383,14 @@ def main():
         "psl.info('Connecting to the browser')",
         "psl.connect(sys.argv[1] if len(sys.argv) > 1 else %r, page_hint=%r)"
         % (url, hint),
-        "psl.checkViewport(%d, %d)" % (vw, vh),
     ]
+    if named:
+        header += [
+            "psl.loadLayout(sys.argv[2] if len(sys.argv) > 2 else None)",
+            "psl.checkViewport()",
+        ]
+    else:
+        header.append("psl.checkViewport(%d, %d)" % (vw, vh))
     writer.header(header)
 
     while True:
@@ -444,13 +398,13 @@ def main():
         choice = input("> ").strip()
         try:
             if choice == "1":
-                do_click(writer, double=False)
+                do_click(writer, double=False, named=named)
             elif choice == "2":
-                do_click(writer, double=True)
+                do_click(writer, double=True, named=named)
             elif choice == "3":
                 do_sendkeys(writer)
             elif choice == "4":
-                do_screen_test(writer, script_base, script_dir)
+                do_screen_test(writer, script_base, script_dir, named=named)
             elif choice == "5":
                 do_wait(writer)
             elif choice == "6":
@@ -463,10 +417,10 @@ def main():
     writer.finish()
     psl.disconnect()
     if fname is None:
-        print("\nDone (immediate mode -- nothing was saved).")
+        print("\nDone (immediate mode -- no script file was saved).")
     else:
         print("\nDone. Script saved to %s" % os.path.abspath(fname))
-        print("Replay with:  python %s  [debug-url]" % fname)
+        print("Replay with:  python %s  [debug-url]%s" % (fname, " [layout-folder]" if named else ""))
 
 
 if __name__ == "__main__":

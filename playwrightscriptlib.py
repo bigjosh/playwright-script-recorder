@@ -12,21 +12,25 @@ Typical generated script:
     psl.alarmOnError()
     psl.connect(sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:9222",
                 page_hint="example.com")
-    psl.checkViewport(1280, 720)
+    psl.loadLayout("layouts/desktop")     # omit path for a folder picker
+    psl.checkViewport()
 
-    psl.click(512, 288)
+    psl.click("message-field")
     psl.sendkeys("hello\rworld")            # \r presses Enter
     psl.wait(2)
-    # compare the live region against a capture PNG saved by the recorder;
+    # compare the live region against the named layout's reference;
     # on mismatch a loud alarm offers: try again / skip / stop the script
-    psl.verifyFrame("capture-myscript-region-100,200,400,300.png",
-                    (100, 200, 400, 300), 0.98, "Screen changed unexpectedly")
+    psl.verifyFrame("message-ready", matchLevel=0.98,
+                    message="Screen changed unexpectedly")
 
 All coordinates are CSS pixels relative to the top-left corner of the page
 viewport -- the same space frameGrab()/viewportGrab() screenshots are in.
+Named definitions are stored by playwrightscriptlayout.py. Legacy numeric
+coordinates and explicit capture paths remain supported without a layout.
 """
 
 import io
+import math
 import os
 import re
 import sys
@@ -36,6 +40,13 @@ import traceback
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 from playwright.sync_api import sync_playwright
+
+import playwrightscriptlayout as _layouts
+import playwrightscriptocr as _ocr
+import playwrightscriptpopup as _popup
+
+# Public error type for callers that want to handle an unreadable OCR region.
+OCRError = _ocr.OCRError
 
 # Tunables for frameSimilarity()/compareFrames(). Defaults are chosen so that
 # lossy-stream compression noise (e.g. a Chrome Remote Desktop session canvas,
@@ -55,6 +66,16 @@ _clicks_settle_time = 0.0
 _shot_dir = None
 _shot_warned = False
 _run_dir = None
+_layout = None
+_click_guard = None
+
+
+class ClickGuardError(RuntimeError):
+    """The screen could not be confirmed clear before requested input."""
+
+
+class ClickGuardTimeout(ClickGuardError):
+    """A popup prevented confirming a clear screen within the time limit."""
 
 
 def _run_folder():
@@ -99,6 +120,82 @@ def _require_browser():
     return _browser
 
 
+def loadLayout(path=None):
+    """Select a named layout folder; omit path to open the folder picker.
+
+    Importing this module never opens a dialog. A new folder records its
+    viewport on the first layout operation, after a browser is connected.
+    Names are resolved only inside this folder, never against the working
+    directory or another layout. Returns the selected Layout object.
+    """
+    global _layout
+    if path is None:
+        _emit("Opening screen layout folder picker; waiting for operator selection")
+        path = _layouts.choose_layout_folder()
+    selected = _layouts.Layout(path)
+    _layout = selected
+    _emit("Layout selected: %s" % selected.path)
+    return selected
+
+
+def _require_layout():
+    if _layout is None:
+        loadLayout()
+    return _layout
+
+
+def layoutViewport():
+    """Return the layout's viewport size, refusing mismatched browser geometry."""
+    selected = _require_layout()
+    selected.check_viewport(viewportSize())
+    return selected.viewport
+
+
+def _layout_entry(name, kind, redefine=False):
+    selected = _require_layout()
+    selected.check_viewport(viewportSize())
+    resolver = selected.define if redefine else selected.resolve
+    entry = resolver(name, kind, viewportGrab)
+    # The operator may have resized the browser while defining this action.
+    selected.check_viewport(viewportSize())
+    return entry
+
+
+def definePoint(name):
+    """Define/redefine a named point on a screenshot, without clicking it."""
+    entry = _layout_entry(name, "point", redefine=True)
+    return (entry["x"], entry["y"])
+
+
+def defineRegion(name):
+    """Define/redefine a named capture rectangle, without a reference image."""
+    return tuple(_layout_entry(name, "region", redefine=True)["box"])
+
+
+def defineFrame(name, *, screenshot=None):
+    """Confirm and save a reference; optionally pick from a saved screenshot.
+
+    A saved full-viewport image must have this layout's viewport dimensions.
+    Selection and confirmation use the same recording UI, without any clicks
+    sent to the browser. Returns (PNG path, box).
+    """
+    if screenshot is None:
+        entry = _layout_entry(name, "frame", redefine=True)
+    else:
+        selected = _require_layout()
+        selected.check_viewport(viewportSize())
+        saved = loadFrame(os.fspath(screenshot))
+        selected.check_viewport(saved.size)
+        entry = selected.define(name, "frame", lambda: saved.copy())
+        selected.check_viewport(viewportSize())
+    return entry["image"], tuple(entry["box"])
+
+
+def layoutBounds(name):
+    """Return a named region's bounds, asking to define it when missing."""
+    return tuple(_layout_entry(name, "region")["box"])
+
+
 def connect(url, page_hint=None):
     """Connect to a running Chrome's remote debug port and pick a tab.
 
@@ -115,9 +212,13 @@ def connect(url, page_hint=None):
     Returns the underlying Playwright page (rarely needed).
     """
     global _pw, _browser, _page
+    _emit("Starting Playwright driver")
     _pw = sync_playwright().start()
+    _emit("Playwright driver started")
     try:
+        _emit("Connecting to browser debug endpoint")
         _browser = _pw.chromium.connect_over_cdp(url)
+        _emit("Browser debug connection established")
     except Exception:
         _pw.stop()
         _pw = None
@@ -138,6 +239,7 @@ def connect(url, page_hint=None):
                 % (page_hint, ", ".join(p.url for p in pages)))
     else:
         _page = pages[0]
+    _emit("Browser tab selected")
     return _page
 
 
@@ -185,15 +287,136 @@ def clicksSettleTime(seconds):
           % (time.strftime("%H:%M:%S"), _clicks_settle_time))
 
 
-def click(x, y):
-    """Single left click at (x, y), CSS pixels from the viewport's top-left."""
+def enableClickGuard(name, *, timeout=30.0, matchLevel=0.90, pollInterval=0.25,
+                     referenceScreenshot=None):
+    """Guard click/doubleClick and each keyboard operation in sendkeys.
+
+    Searches the whole viewport for a distinctive, fixed-size reference patch.
+    Configure once after loading the layout. Missing references use the usual
+    recording UI; referenceScreenshot imports/redefines from a saved full
+    viewport screenshot instead. Pick constant text or an icon from the popup.
+
+    Two consecutive clear captures are required. A persistent popup, capture
+    error, or changed page/layout/viewport prevents the pending input. The overall
+    timeout includes capture and detection; waiting cannot be skipped.
+    sendkeys checks before Home, Shift+End, each text chunk, and each Enter;
+    a text chunk is sent as one keyboard.type call, not guarded per character.
+    """
+    global _click_guard
+    timeout, interval = float(timeout), float(pollInterval)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("Click guard timeout must be a positive finite number.")
+    if not math.isfinite(interval) or interval <= 0 or interval >= timeout:
+        raise ValueError("Click guard poll interval must be positive and less than timeout.")
+    page = _require_page()
+    if referenceScreenshot is not None:
+        defineFrame(name, screenshot=referenceScreenshot)
+    entry = _layout_entry(name, "frame")
+    selected = _require_layout()
+    matcher = _popup.PopupMatcher(loadFrame(entry["image"]), threshold=matchLevel)
+    # Commit only a fully validated configuration. Failed reconfiguration must
+    # never silently disable a previously enabled guard.
+    _click_guard = dict(name=name, timeout=timeout, interval=interval,
+                        matcher=matcher, layout=selected, page=page,
+                        viewport=tuple(selected.viewport))
+    _emit("Popup input guard enabled: %s; waiting up to %gs for two clear captures"
+          % (name, timeout))
+
+
+def disableClickGuard():
+    """Explicitly disable the optional popup guard for mouse and keyboard input."""
+    global _click_guard
+    _click_guard = None
+
+
+def _save_click_guard_timeout(shot):
+    if shot is None:
+        return
+    try:
+        path = os.path.join(_run_folder(), "click-guard-timeout-%s-%s.png"
+                            % (time.strftime("%H%M%S"), time.time_ns()))
+        shot.save(path)
+        _emit("Saved popup timeout screenshot: %s" % path)
+    except Exception as exc:
+        _emit("Could not save popup timeout screenshot: %s" % exc)
+
+
+def _wait_for_click_guard(action="click"):
+    guard = _click_guard
+    if guard is None:
+        return
+    deadline = time.monotonic() + guard["timeout"]
+    clear_count = 0
+    waiting = False
+    last_shot = None
+
+    def timed_out():
+        _save_click_guard_timeout(last_shot)
+        raise ClickGuardTimeout(
+            "Popup guard %r did not confirm a clear screen within %gs; "
+            "the pending %s was NOT sent. Earlier input, if any, is not replayed."
+            % (guard["name"], guard["timeout"], action))
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out()
+        if _page is not guard["page"] or _layout is not guard["layout"]:
+            raise ClickGuardError("The page or layout changed after enabling the click guard; "
+                                  "configure it again before sending input.")
+        try:
+            # Never use 0: Playwright interprets it as disabling the timeout.
+            last_shot = viewportGrab(timeout=max(1, min(2000, int(remaining * 1000))))
+            if last_shot.size != guard["viewport"]:
+                raise ClickGuardError("Viewport changed during the popup check; "
+                                      "restore the recorded layout size before sending input.")
+            if time.monotonic() >= deadline:
+                timed_out()
+            found = guard["matcher"].locate(last_shot)
+        except ClickGuardError:
+            raise
+        except Exception as exc:
+            raise ClickGuardError("Could not check for popup %r; the pending %s was NOT sent: %s"
+                                  % (guard["name"], action, exc)) from exc
+        if time.monotonic() >= deadline:
+            timed_out()
+        if found is not None:
+            clear_count = 0
+            if not waiting:
+                _emit("Popup %r detected; waiting for it to disappear (up to %gs)"
+                      % (guard["name"], guard["timeout"]))
+                waiting = True
+        else:
+            clear_count += 1
+            if clear_count >= 2:
+                # No logging or UI between the final fresh check and input.
+                return
+            if waiting:
+                _emit("Popup %r appears clear; confirming with another fresh capture" % guard["name"])
+        time.sleep(min(guard["interval"], max(0.0, deadline - time.monotonic())))
+
+
+def click(x, y=None):
+    """Click a named layout point, or legacy (x, y) viewport coordinates."""
+    if isinstance(x, str) and y is None:
+        entry = _layout_entry(x, "point")
+        x, y = entry["x"], entry["y"]
+    elif y is None:
+        raise TypeError("click requires a layout name or both x and y")
+    _wait_for_click_guard()
     _require_page().mouse.click(x, y)
     if _clicks_settle_time > 0:
         time.sleep(_clicks_settle_time)
 
 
-def doubleClick(x, y):
-    """Double left click at (x, y), CSS pixels from the viewport's top-left."""
+def doubleClick(x, y=None):
+    """Double-click a named layout point, or legacy (x, y) coordinates."""
+    if isinstance(x, str) and y is None:
+        entry = _layout_entry(x, "point")
+        x, y = entry["x"], entry["y"]
+    elif y is None:
+        raise TypeError("doubleClick requires a layout name or both x and y")
+    _wait_for_click_guard()
     _require_page().mouse.dblclick(x, y)
     if _clicks_settle_time > 0:
         time.sleep(_clicks_settle_time)
@@ -212,27 +435,39 @@ def sendkeys(text, delay=20, HomeShiftEndPrefix=True):
     '--').  The prefix repeats for each \r-separated chunk, so chained
     "value\rvalue" entries clean each field they land in; pass
     HomeShiftEndPrefix=False to append to existing content instead.
+
+    When enableClickGuard() is configured, every Home, Shift+End, text chunk,
+    and Enter waits for the popup to clear before it is sent. Each text chunk
+    remains one keyboard.type operation. Already-sent input is never replayed
+    if a later operation times out or fails.
     """
     page = _require_page()
     normalized = text.replace("\r\n", "\r").replace("\n", "\r")
     parts = normalized.split("\r")
     for i, part in enumerate(parts):
         if part and HomeShiftEndPrefix:
+            _wait_for_click_guard(action="keyboard input")
             page.keyboard.press("Home")
             if delay:
                 time.sleep(delay / 1000.0)
+            _wait_for_click_guard(action="keyboard input")
             page.keyboard.press("Shift+End")
             if delay:
                 time.sleep(delay / 1000.0)
         if part:
+            _wait_for_click_guard(action="keyboard input")
             page.keyboard.type(part, delay=delay)
         if i < len(parts) - 1:
+            _wait_for_click_guard(action="keyboard input")
             page.keyboard.press("Enter")
 
 
-def viewportGrab():
-    """Screenshot of the whole visible viewport as a Pillow RGB image."""
-    png = _require_page().screenshot(scale="css")
+def viewportGrab(*, timeout=None):
+    """Screenshot of the viewport as RGB; optional timeout is in milliseconds."""
+    options = {"scale": "css"}
+    if timeout is not None:
+        options["timeout"] = timeout
+    png = _require_page().screenshot(**options)
     return Image.open(io.BytesIO(png)).convert("RGB")
 
 
@@ -243,14 +478,14 @@ def viewportSize():
             int(page.evaluate("window.innerHeight")))
 
 
-def _frame_and_full(x1, y1, x2, y2):
+def _frame_and_full(x1, y1, x2, y2, *, timeout=None):
     """(cropped region, full viewport) taken from ONE screenshot, so the
     crop is guaranteed to be a piece of the returned full frame."""
     if x1 < 0 or y1 < 0 or x2 <= x1 or y2 <= y1:
         raise ValueError(
             "frameGrab needs 0 <= x1 < x2 and 0 <= y1 < y2, got (%s, %s, %s, %s)"
             % (x1, y1, x2, y2))
-    shot = viewportGrab()
+    shot = viewportGrab() if timeout is None else viewportGrab(timeout=timeout)
     if x2 > shot.width or y2 > shot.height:
         raise ValueError(
             "frame (%s, %s, %s, %s) reaches outside the %sx%s viewport"
@@ -258,9 +493,44 @@ def _frame_and_full(x1, y1, x2, y2):
     return shot.crop((int(x1), int(y1), int(x2), int(y2))), shot
 
 
-def frameGrab(x1, y1, x2, y2):
-    """Screenshot of the viewport rectangle (x1, y1)-(x2, y2) as a Pillow image."""
+def frameGrab(x1, y1=None, x2=None, y2=None):
+    """Capture a named region, or legacy rectangle coordinates, as a Pillow image."""
+    if isinstance(x1, str) and y1 is None and x2 is None and y2 is None:
+        box = layoutBounds(x1)
+        cropped, full = _frame_and_full(*box)
+        _require_layout().check_viewport(full.size)
+        return cropped
+    if y1 is None or x2 is None or y2 is None:
+        raise TypeError("frameGrab requires a layout name or four rectangle coordinates")
     return _frame_and_full(x1, y1, x2, y2)[0]
+
+
+def grabOCRTextLine(x1, y1=None, x2=None, y2=None, *, tesseract_cmd=None):
+    """Capture a named layout region and return its text as one string.
+
+    Like frameGrab(), accepts either a region name or four rectangle
+    coordinates in CSS pixels. A missing named region uses the normal layout
+    definition dialog; every call captures fresh pixels after it is defined.
+
+    Uses local Tesseract with English data in single-line mode. Pass
+    tesseract_cmd to select its executable, otherwise PATH and standard Windows
+    install locations are searched. Checks OCR availability before capture or
+    opening a definition dialog. No browser clicks or keys are sent.
+
+    Leading/trailing whitespace is removed; internal spacing, signs, decimal
+    points and other recognized characters are preserved. This function does
+    not parse or validate values. Raises OCRError for OCR setup/execution
+    failures, no text, or unexpected multiple lines. Layout/capture errors
+    propagate just as they do in frameGrab().
+    """
+    reader = _ocr.TesseractReader(tesseract_cmd)
+    pixels = frameGrab(x1, y1, x2, y2)
+    text = reader(pixels).strip()
+    if not text:
+        raise OCRError("OCR returned no text for the selected rectangle.")
+    if len(text.splitlines()) != 1:
+        raise OCRError("OCR returned multiple lines; select a rectangle containing one text line.")
+    return text
 
 
 def loadFrame(path):
@@ -349,9 +619,12 @@ def _pixel_inspector(parent, expected, actual):
     Shows both frames blown up with nearest-neighbour pixels (grid lines
     from 8x), scrolling in sync.  Clicking a pixel on either side
     highlights the same location on both and reports the two RGB values
-    and their max channel difference.  Returns the Toplevel window.
+    and their max channel difference.  Returns the Toplevel window with
+    update_actual(image) and set_live_status(text) methods. Updates preserve
+    the selected pixel, zoom and scroll positions; they never resize a capture.
     """
     import tkinter as tk
+    from math import isqrt
     from PIL import ImageTk
 
     expected = expected.convert("RGB")
@@ -359,18 +632,23 @@ def _pixel_inspector(parent, expected, actual):
     if actual.size != expected.size:
         actual = actual.resize(expected.size, Image.LANCZOS)
     w, h = expected.size
+    # Keep live redraw allocations bounded when inspecting a large capture.
+    # A capture already above the budget stays at its original 1x size.
+    max_zoom = max(1, min(64, isqrt(4_000_000 // max(w * h, 1))))
 
     top = tk.Toplevel(parent)
     top.title("Pixel inspector")
     top.attributes("-topmost", True)
 
-    state = {"zoom": max(1, min(32, 480 // max(w, 1), 320 // max(h, 1))),
+    state = {"zoom": max(1, min(max_zoom, 32, 480 // max(w, 1), 320 // max(h, 1))),
              "sel": None}
     photos = {}
 
     info = tk.Label(top, text="Click a pixel to inspect it",
                     font=("Consolas", 10))
     info.pack(padx=10, pady=(10, 2))
+    live_status = tk.Label(top, text="", font=("Segoe UI", 9))
+    live_status.pack(padx=10, pady=(0, 2))
 
     grid_frame = tk.Frame(top)
     grid_frame.pack(padx=10, pady=4)
@@ -404,7 +682,19 @@ def _pixel_inspector(parent, expected, actual):
             canvas.create_rectangle(px * z, py * z, (px + 1) * z, (py + 1) * z,
                                     outline="#ffee00", width=2, tags="sel")
 
-    def redraw():
+    def refresh_pixel_info():
+        if state["sel"] is None:
+            return
+        px, py = state["sel"]
+        e_rgb = expected.getpixel((px, py))
+        a_rgb = actual.getpixel((px, py))
+        diff = max(abs(e_rgb[i] - a_rgb[i]) for i in range(3))
+        info.config(text="Pixel (%d, %d)   expected RGB %s   actual RGB %s   "
+                         "max channel diff %d" % (px, py, e_rgb, a_rgb, diff))
+
+    def redraw(preserve_scroll=False):
+        offsets = [(canvas.xview()[0], canvas.yview()[0])
+                   for canvas in (c_exp, c_act)] if preserve_scroll else None
         z = state["zoom"]
         zw, zh = w * z, h * z
         photos["exp"] = ImageTk.PhotoImage(
@@ -421,7 +711,12 @@ def _pixel_inspector(parent, expected, actual):
                     canvas.create_line(0, gy, zw, gy, fill="#666666")
             canvas.config(scrollregion=(0, 0, zw, zh),
                           width=min(zw, 430), height=min(zh, 320))
+        if offsets is not None:
+            for canvas, (x_offset, y_offset) in zip((c_exp, c_act), offsets):
+                canvas.xview_moveto(x_offset)
+                canvas.yview_moveto(y_offset)
         draw_sel()
+        refresh_pixel_info()
         zoom_label.config(text="zoom %dx" % z)
 
     def on_click(event, canvas):
@@ -431,11 +726,7 @@ def _pixel_inspector(parent, expected, actual):
         if not (0 <= px < w and 0 <= py < h):
             return
         state["sel"] = (px, py)
-        e_rgb = expected.getpixel((px, py))
-        a_rgb = actual.getpixel((px, py))
-        diff = max(abs(e_rgb[i] - a_rgb[i]) for i in range(3))
-        info.config(text="Pixel (%d, %d)   expected RGB %s   actual RGB %s   "
-                         "max channel diff %d" % (px, py, e_rgb, a_rgb, diff))
+        refresh_pixel_info()
         draw_sel()
 
     c_exp.bind("<Button-1>", lambda ev: on_click(ev, c_exp))
@@ -443,7 +734,7 @@ def _pixel_inspector(parent, expected, actual):
 
     def set_zoom(direction):
         z = state["zoom"]
-        nz = min(64, z * 2) if direction > 0 else max(1, z // 2)
+        nz = min(max_zoom, z * 2) if direction > 0 else max(1, z // 2)
         if nz != z:
             state["zoom"] = nz
             redraw()
@@ -459,147 +750,324 @@ def _pixel_inspector(parent, expected, actual):
     tk.Button(controls, text="Close", font=("Segoe UI", 10, "bold"),
               command=top.destroy, padx=14).pack(side="left", padx=4)
 
+    def update_actual(image):
+        nonlocal actual
+        if image.size != expected.size:
+            raise ValueError("Live pixel capture size %s does not match expected size %s"
+                             % (image.size, expected.size))
+        actual = image.convert("RGB")
+        redraw(preserve_scroll=True)
+
+    top.update_actual = update_actual
+    top.set_live_status = lambda text: live_status.config(text=text)
     redraw()
     top.lift()
     return top
 
 
-def _diff_viewer(expected, actual, score, matchLevel, box=None, full=None):
-    """Side-by-side window: saved capture vs current screen, with a toggle
-    that tints the differing areas red.  When box and full are given, a
-    button shows the capture region inside the full frame grab, marked with
-    a blinking red rectangle.  Blocks until closed."""
+def _grab_live_compare(box, expected_size, expected_viewport=None):
+    """One bounded screenshot for an alignment preview; never rescale geometry."""
+    actual, full = _frame_and_full(*box, timeout=2000)
+    if expected_viewport is not None and full.size != tuple(expected_viewport):
+        raise ValueError(
+            "Viewport is %dx%d; restore %dx%d to align this layout."
+            % (*full.size, *expected_viewport))
+    if actual.size != tuple(expected_size):
+        raise ValueError("Capture dimensions differ from the saved reference.")
+    return actual, full
+
+
+class _LiveCompareRefresh:
+    """Synchronous refresh state; poll outside Tk callbacks on the owning thread."""
+
+    def __init__(self, capture, on_frame, on_status, interval=1.0, clock=None):
+        self.capture = capture
+        self.on_frame = on_frame
+        self.on_status = on_status
+        self.interval = interval
+        self.clock = clock or time.monotonic
+        self.enabled = True
+        self.closed = False
+        self.busy = False
+        self.pending = True
+        self.deadline = 0.0
+        self.error = None
+        self.updated = None
+
+    def _publish_status(self):
+        if self.error:
+            mode = "Live refresh" if self.enabled else "Paused"
+            self.on_status("%s failed: %s — showing the last captured image"
+                           % (mode, self.error), stale=True)
+        else:
+            mode = "Live — updates every 1 second" if self.enabled else "Paused"
+            stamp = "last capture %s" % self.updated if self.updated else "waiting for first refresh"
+            self.on_status("%s; %s" % (mode, stamp), stale=False)
+
+    def set_enabled(self, enabled):
+        self.enabled = bool(enabled)
+        self.pending = self.enabled
+        self._publish_status()
+
+    def request_refresh(self):
+        self.pending = True
+
+    def close(self):
+        self.closed = True
+        self.pending = False
+
+    def poll(self):
+        if self.closed or self.busy:
+            return False
+        if not self.pending and (not self.enabled or self.clock() < self.deadline):
+            return False
+        self.pending = False
+        self.busy = True
+        try:
+            try:
+                actual, full = self.capture()
+            except Exception as exc:
+                # Keep multi-line browser traces from expanding the dialog off-screen.
+                detail = str(exc).strip()
+                self.error = detail.splitlines()[0][:240] if detail else type(exc).__name__
+                self._publish_status()
+                return False
+            self.on_frame(actual, full)
+            self.error = None
+            self.updated = time.strftime("%H:%M:%S")
+            self._publish_status()
+            return True
+        finally:
+            self.busy = False
+            # Cadence begins after completion; slow captures never build a queue.
+            self.deadline = self.clock() + self.interval
+
+
+def _diff_viewer(expected, actual, score, matchLevel, box=None, full=None,
+                 refresh_callback=None):
+    """Live alignment preview. Closing returns to the alarm, never resumes.
+
+    A refresh callback supplies (crop, full screenshot) on the Playwright
+    owning thread. Tk callbacks only change UI state; browser calls happen
+    between event-pump iterations. Every window is destroyed on exit.
+    """
     import tkinter as tk
     from PIL import ImageTk
 
     expected = expected.convert("RGB")
     actual = actual.convert("RGB")
     if actual.size != expected.size:
-        actual = actual.resize(expected.size, Image.LANCZOS)
-    mask = _diff_mask(expected, actual)
-    diff_pct = 100.0 * mask.histogram()[255] / float(mask.width * mask.height)
+        raise ValueError("Comparison capture dimensions differ from the reference.")
 
     root = tk.Tk()
-    root.title("Compare differences")
-    root.attributes("-topmost", True)
+    controller = None
+    try:
+        root.title("Compare differences — live alignment")
+        root.attributes("-topmost", True)
+        scale = min(1.0, 0.44 * root.winfo_screenwidth() / expected.width,
+                    0.60 * root.winfo_screenheight() / expected.height)
+        current = {"actual": actual, "full": full, "score": score, "diff_pct": 0.0}
+        context = {"win": None}
+        pixels = {"win": None}
+        running = {"open": True}
+        latest_status = {"text": "Captured image from the failed verification", "stale": False}
 
-    scale = min(1.0, 0.44 * root.winfo_screenwidth() / expected.width,
-                0.72 * root.winfo_screenheight() / expected.height)
-
-    def fit(im):
-        if scale >= 1.0:
-            return im
-        return im.resize((max(1, int(im.width * scale)),
-                          max(1, int(im.height * scale))), Image.LANCZOS)
-
-    photos = {
-        False: (ImageTk.PhotoImage(fit(expected)), ImageTk.PhotoImage(fit(actual))),
-        True: (ImageTk.PhotoImage(fit(_highlight(expected, mask))),
-               ImageTk.PhotoImage(fit(_highlight(actual, mask)))),
-    }
-
-    tk.Label(root, text="Similarity %.4f (needs at least %s) -- %.1f%% of the area differs"
-             % (score, matchLevel, diff_pct),
-             font=("Segoe UI", 12, "bold")).pack(pady=(10, 4))
-    row = tk.Frame(root)
-    row.pack(padx=10, pady=4)
-    panes = []
-    for column, caption in ((0, "Expected (saved capture)"), (1, "Actual (screen now)")):
-        pane = tk.Frame(row)
-        pane.grid(row=0, column=column, padx=8)
-        tk.Label(pane, text=caption, font=("Segoe UI", 11)).pack()
-        img_label = tk.Label(pane)
-        img_label.pack()
-        panes.append(img_label)
-
-    highlight_on = tk.BooleanVar(value=True)
-
-    def refresh():
-        left, right = photos[highlight_on.get()]
-        panes[0].config(image=left)
-        panes[1].config(image=right)
-
-    context = {"win": None}
-
-    def open_context():
-        try:
-            if context["win"] is not None and context["win"].winfo_exists():
-                context["win"].lift()
-                context["win"].focus_force()
-                return
-        except Exception:
-            pass
-        top = tk.Toplevel(root)
-        context["win"] = top
-        top.title("Compare region inside the full frame grab")
-        top.attributes("-topmost", True)
-        cscale = min(1.0, 0.88 * top.winfo_screenwidth() / full.width,
-                     0.78 * top.winfo_screenheight() / full.height)
-        if cscale < 1.0:
-            disp = full.resize((max(1, int(full.width * cscale)),
-                                max(1, int(full.height * cscale))), Image.LANCZOS)
-        else:
-            disp = full
-        top._photo = ImageTk.PhotoImage(disp, master=top)
-        tk.Label(top, text="Blinking red box = the region this compare grabs: "
-                           "(%d, %d)-(%d, %d) of the %dx%d viewport"
-                 % (box[0], box[1], box[2], box[3], full.width, full.height),
-                 font=("Segoe UI", 11)).pack(pady=(8, 4))
-        canvas = tk.Canvas(top, width=disp.width, height=disp.height,
-                           highlightthickness=0)
-        canvas.pack(padx=8, pady=4)
-        canvas.create_image(0, 0, image=top._photo, anchor="nw")
-        rx1, ry1, rx2, ry2 = [int(round(v * cscale)) for v in box]
-        rect = canvas.create_rectangle(rx1, ry1, rx2, ry2,
-                                       outline="#ff2020", width=3)
-        blink = {"on": True}
-
-        def blink_tick():
+        def alive(window):
             try:
-                if not canvas.winfo_exists():
-                    return
-                blink["on"] = not blink["on"]
-                canvas.itemconfigure(
-                    rect, outline="#ff2020" if blink["on"] else "#ffffff")
-                top.after(400, blink_tick)
-            except Exception:
-                pass
+                return window is not None and bool(window.winfo_exists())
+            except tk.TclError:
+                return False
 
-        top.after(400, blink_tick)
-        tk.Button(top, text="Close", font=("Segoe UI", 11, "bold"),
-                  command=top.destroy, padx=16, pady=4).pack(pady=(4, 10))
+        def fit(im):
+            if scale >= 1.0:
+                return im
+            return im.resize((max(1, int(im.width * scale)),
+                              max(1, int(im.height * scale))), Image.LANCZOS)
 
-    pixels = {"win": None}
+        tk.Label(root, text="Adjust the application window while watching the live capture.",
+                 font=("Segoe UI", 11)).pack(padx=12, pady=(10, 2))
+        score_label = tk.Label(root, font=("Segoe UI", 12, "bold"))
+        score_label.pack(padx=12, pady=4)
+        status_label = tk.Label(root, font=("Segoe UI", 10), wraplength=850)
+        status_label.pack(padx=12, pady=2)
+        row = tk.Frame(root)
+        row.pack(padx=10, pady=4)
+        panes = []
+        for column, caption in ((0, "Expected (saved reference)"),
+                                (1, "Actual (latest captured image)")):
+            pane = tk.Frame(row)
+            pane.grid(row=0, column=column, padx=8)
+            tk.Label(pane, text=caption, font=("Segoe UI", 11)).pack()
+            label = tk.Label(pane)
+            label.pack()
+            panes.append(label)
 
-    def open_pixels():
-        try:
-            if pixels["win"] is not None and pixels["win"].winfo_exists():
-                pixels["win"].lift()
-                pixels["win"].focus_force()
+        photos = {}
+        highlight_on = tk.BooleanVar(master=root, value=True)
+
+        def render_score():
+            if latest_status["stale"]:
+                score_label.config(text="No current comparison — last captured image is shown",
+                                   fg="#b00020")
+            else:
+                matched = current["score"] >= matchLevel
+                score_label.config(
+                    text="%s in captured image — similarity %.4f (needs %s); %.1f%% differs"
+                         % ("MATCH" if matched else "MISMATCH", current["score"],
+                            matchLevel, current["diff_pct"]),
+                    fg="#176b35" if matched else "#b00020")
+
+        def render():
+            mask = _diff_mask(expected, current["actual"])
+            current["diff_pct"] = 100.0 * mask.histogram()[255] / (mask.width * mask.height)
+            left, right = expected, current["actual"]
+            if highlight_on.get():
+                left, right = _highlight(left, mask), _highlight(right, mask)
+            photos["expected"] = ImageTk.PhotoImage(fit(left), master=root)
+            photos["actual"] = ImageTk.PhotoImage(fit(right), master=root)
+            panes[0].config(image=photos["expected"])
+            panes[1].config(image=photos["actual"])
+            render_score()
+
+        def show_status(text, stale=False):
+            latest_status.update(text=text, stale=stale)
+            status_label.config(text=text, fg="#b00020" if stale else "#444444")
+            render_score()
+            if alive(pixels["win"]):
+                pixels["win"].set_live_status(text)
+            if alive(context["win"]):
+                context["status"].config(text=text, fg="#b00020" if stale else "#444444")
+
+        def update_context():
+            if not alive(context["win"]) or current["full"] is None:
                 return
-        except Exception:
-            pass
-        pixels["win"] = _pixel_inspector(root, expected, actual)
+            top = context["win"]
+            frame = current["full"]
+            cscale = min(1.0, 0.88 * top.winfo_screenwidth() / frame.width,
+                         0.72 * top.winfo_screenheight() / frame.height)
+            size = (max(1, int(frame.width * cscale)), max(1, int(frame.height * cscale)))
+            disp = frame if cscale >= 1.0 else frame.resize(size, Image.LANCZOS)
+            top._photo = ImageTk.PhotoImage(disp, master=top)
+            canvas = context["canvas"]
+            canvas.itemconfigure(context["image"], image=top._photo)
+            canvas.config(width=disp.width, height=disp.height)
+            canvas.coords(context["rect"], *[int(round(v * cscale)) for v in box])
+            context["label"].config(
+                text="Blinking box: (%d, %d)-(%d, %d) in the %dx%d viewport"
+                     % (*box, frame.width, frame.height))
 
-    tk.Checkbutton(root, text="Highlight differences (red)", variable=highlight_on,
-                   command=refresh, font=("Segoe UI", 11)).pack(pady=4)
-    tk.Button(root, text="View pixels", font=("Segoe UI", 11),
-              command=open_pixels, padx=12, pady=4).pack(pady=4)
-    if full is not None and box is not None:
-        tk.Button(root, text="Show current capture inside full frame grab",
-                  font=("Segoe UI", 11), command=open_context,
-                  padx=12, pady=4).pack(pady=4)
-    tk.Button(root, text="Back to alarm", font=("Segoe UI", 12, "bold"),
-              command=root.destroy, padx=20, pady=6).pack(pady=(4, 12))
-    refresh()
-    root.protocol("WM_DELETE_WINDOW", root.destroy)
-    root.update_idletasks()
-    x = (root.winfo_screenwidth() - root.winfo_width()) // 2
-    y = (root.winfo_screenheight() - root.winfo_height()) // 4
-    root.geometry("+%d+%d" % (x, y))
-    root.lift()
-    root.focus_force()
-    root.mainloop()
+        def open_context():
+            if alive(context["win"]):
+                context["win"].lift()
+                return
+            if current["full"] is None or box is None:
+                return
+            top = tk.Toplevel(root)
+            context["win"] = top
+            top.title("Live capture region in full frame")
+            top.attributes("-topmost", True)
+            context["label"] = tk.Label(top, font=("Segoe UI", 11))
+            context["label"].pack(padx=8, pady=(8, 4))
+            context["status"] = tk.Label(top, text=latest_status["text"],
+                                         font=("Segoe UI", 10), wraplength=850,
+                                         fg="#b00020" if latest_status["stale"] else "#444444")
+            context["status"].pack(padx=8, pady=2)
+            canvas = context["canvas"] = tk.Canvas(top, highlightthickness=0)
+            canvas.pack(padx=8, pady=4)
+            context["image"] = canvas.create_image(0, 0, anchor="nw")
+            context["rect"] = canvas.create_rectangle(0, 0, 1, 1, outline="#ff2020", width=3)
+            context["blink"] = True
+            context["next_blink"] = time.monotonic() + 0.4
+            tk.Button(top, text="Close", font=("Segoe UI", 11, "bold"),
+                      command=top.destroy, padx=16, pady=4).pack(pady=(4, 10))
+            update_context()
+
+        def blink_context():
+            if alive(context["win"]) and time.monotonic() >= context["next_blink"]:
+                context["blink"] = not context["blink"]
+                context["canvas"].itemconfigure(
+                    context["rect"], outline="#ff2020" if context["blink"] else "#ffffff")
+                context["next_blink"] = time.monotonic() + 0.4
+
+        def open_pixels():
+            if alive(pixels["win"]):
+                pixels["win"].lift()
+                return
+            pixels["win"] = _pixel_inspector(root, expected, current["actual"])
+            pixels["win"].set_live_status(latest_status["text"])
+
+        def accept_frame(fresh, full_frame):
+            if fresh.size != expected.size:
+                raise ValueError("Live capture dimensions differ from the saved reference.")
+            current.update(actual=fresh.convert("RGB"), full=full_frame,
+                           score=frameSimilarity(expected, fresh))
+            render()
+            if alive(pixels["win"]):
+                pixels["win"].update_actual(current["actual"])
+            update_context()
+
+        tk.Checkbutton(root, text="Highlight differences (red)", variable=highlight_on,
+                       command=render, font=("Segoe UI", 11)).pack(pady=4)
+
+        if refresh_callback is not None:
+            controller = _LiveCompareRefresh(refresh_callback, accept_frame, show_status)
+            controls = tk.Frame(root)
+            controls.pack(pady=4)
+
+            def toggle_live():
+                controller.set_enabled(not controller.enabled)
+                pause_button.config(text="Pause live refresh" if controller.enabled
+                                    else "Resume live refresh")
+
+            pause_button = tk.Button(controls, text="Pause live refresh",
+                                     font=("Segoe UI", 11), command=toggle_live,
+                                     padx=12, pady=4)
+            pause_button.pack(side="left", padx=4)
+            tk.Button(controls, text="Refresh now", font=("Segoe UI", 11),
+                      command=controller.request_refresh, padx=12, pady=4).pack(side="left", padx=4)
+
+        tk.Button(root, text="View pixels", font=("Segoe UI", 11),
+                  command=open_pixels, padx=12, pady=4).pack(pady=4)
+        if full is not None and box is not None:
+            tk.Button(root, text="Show current capture inside full frame grab",
+                      font=("Segoe UI", 11), command=open_context,
+                      padx=12, pady=4).pack(pady=4)
+
+        def request_close():
+            running["open"] = False
+
+        tk.Label(root, text="When aligned, go Back to alarm and choose Try compare again.",
+                 font=("Segoe UI", 10)).pack(padx=12, pady=(4, 0))
+        tk.Button(root, text="Back to alarm", font=("Segoe UI", 12, "bold"),
+                  command=request_close, padx=20, pady=6).pack(pady=(4, 12))
+        root.protocol("WM_DELETE_WINDOW", request_close)
+        root.bind("<Escape>", lambda event: request_close())
+        render()
+        show_status(latest_status["text"])
+        root.update_idletasks()
+        x = max(0, (root.winfo_screenwidth() - root.winfo_width()) // 2)
+        y = max(0, (root.winfo_screenheight() - root.winfo_height()) // 4)
+        root.geometry("+%d+%d" % (x, y))
+        root.lift()
+        root.focus_force()
+
+        # No screenshots in Tk callbacks or worker threads: Playwright remains
+        # on the thread/greenlet that owns its connection, with no reentrancy.
+        while running["open"] and alive(root):
+            root.update()
+            if not running["open"] or not alive(root):
+                break
+            if controller is not None:
+                controller.poll()
+            blink_context()
+            time.sleep(0.03)
+    finally:
+        if controller is not None:
+            controller.close()
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
 
 
 def _save_diff_files(expected, actual, full=None, box=None):
@@ -762,19 +1230,28 @@ class _VerifyPopup:
         self.hidden = True
 
 
-def verifyFrame(baselinePath, box, matchLevel, message, delay=0, retrycount=0):
-    """Compare the live screen region against a saved capture PNG.
+def verifyFrame(baselinePath, box=None, matchLevel=0.98, message=None, delay=0, retrycount=0,
+                fallthru=False):
+    """Compare a named layout frame, or a legacy explicit PNG and rectangle.
+
+    Named form: verifyFrame("focus-ready", matchLevel=0.99, delay=10,
+    retrycount=24). Only geometry and the reference PNG come from the layout;
+    thresholds, timing, messages, and mismatch handling remain script options.
+    A missing frame asks the operator to establish the expected state and
+    explicitly accept a preview before saving. Canceling definition stops.
 
     box is (x1, y1, x2, y2) -- the region the capture was taken from.  On a
-    mismatch a loud alarm is raised offering the operator four choices:
+    mismatch a loud alarm is raised offering the operator four choices
+    (unless fallthru=True, see below):
 
       1. Try compare again -- e.g. after manually putting the target page
          back into the right state
-      2. Show differences  -- side-by-side viewer of the saved capture and
-         the current screen, with differing areas highlighted in red and a
-         button that shows the capture region inside the full frame grab
-         (blinking red box), then back to the alarm (saves diff PNGs
-         instead when there is no display)
+      2. Show differences  -- live side-by-side alignment viewer, refreshing
+         the capture, score, highlights, pixel inspector and full-frame
+         context about once per second. Pause/manual refresh are available.
+         The saved reference stays fixed. Return to the alarm and choose
+         Try compare again to recheck; live preview never resumes execution.
+         Saves diff PNGs instead when there is no display.
       3. Skip and continue -- accept the mismatch and resume the script
       4. Stop the script   -- abort immediately (exit code 2)
 
@@ -793,20 +1270,34 @@ def verifyFrame(baselinePath, box, matchLevel, message, delay=0, retrycount=0):
     the give-up alarm reports the try count.  The operator's "Try compare
     again" button reruns the whole cycle.
 
+    fallthru=True turns the give-up into a quiet outcome: when the frames
+    still do not match after the last try, no alarm is raised -- a line is
+    logged and False is returned for the caller to act on (branch, retry
+    something else, alarm itself...).  The countdown window and its
+    buttons behave exactly as before while the tries are running.
+
     Returns True when the frames matched (possibly after retries), False
-    when the operator chose to skip.
+    when the operator chose to skip / abort the verify, or -- with
+    fallthru=True -- when the tries ran out without a match.
     """
     if not 0.0 <= matchLevel <= 1.0:
         raise ValueError("matchLevel must be between 0.0 and 1.0")
     delay = max(0.0, float(delay))
     attempts = max(1, int(retrycount))
+    named = box is None
+    layout_name = baselinePath if named else None
+    if message is None:
+        message = "Screen does not match %s" % baselinePath
+    if named:
+        entry = _layout_entry(layout_name, "frame")
+        baselinePath, box = entry["image"], tuple(entry["box"])
     baseline = loadFrame(baselinePath)
     x1, y1, x2, y2 = box
     region = (x1, y1, x2, y2)
     base_name = os.path.basename(str(baselinePath))
     name_match = re.match(
         r"^capture-.+-([A-Za-z_][A-Za-z0-9_]*)-\d+,\d+,\d+,\d+\.png$", base_name)
-    display_name = name_match.group(1) if name_match else base_name
+    display_name = layout_name if named else (name_match.group(1) if name_match else base_name)
     while True:
         popup = None
         if delay > 0 or attempts > 1:
@@ -827,7 +1318,11 @@ def verifyFrame(baselinePath, box, matchLevel, message, delay=0, retrycount=0):
                     break
                 if popup is not None:
                     popup.note_grab(attempt, attempts)
+                if named:
+                    layoutViewport()
                 fresh, full = _frame_and_full(x1, y1, x2, y2)
+                if named:
+                    _require_layout().check_viewport(full.size)
                 score = frameSimilarity(baseline, fresh)
                 if score >= matchLevel:
                     if attempt > 1:
@@ -855,13 +1350,23 @@ def verifyFrame(baselinePath, box, matchLevel, message, delay=0, retrycount=0):
                       % (message, score, attempts, matchLevel))
         else:
             detail = "%s  (similarity %.4f, needs at least %s)" % (message, score, matchLevel)
+        if fallthru:
+            _emit("[%s] Screen test '%s' did not match -- falling through: %s"
+                  % (time.strftime("%H:%M:%S"), display_name, detail))
+            return False
         while True:
             choice = alarm(detail, buttons=("Try compare again", "Show differences",
                                             "Skip and continue", "Stop the script"))
             if choice != 1:
                 break
             try:
-                _diff_viewer(baseline, fresh, score, matchLevel, box=region, full=full)
+                live_viewport = tuple(_require_layout().viewport) if named else None
+
+                def refresh_capture():
+                    return _grab_live_compare(region, baseline.size, live_viewport)
+
+                _diff_viewer(baseline, fresh, score, matchLevel, box=region, full=full,
+                             refresh_callback=refresh_capture)
             except Exception:
                 try:
                     for path in _save_diff_files(baseline, fresh, full=full, box=region):
@@ -907,8 +1412,12 @@ def _wait_window(seconds):
              fg="white", bg="#1e5631").pack(padx=40, pady=(0, 8))
 
     timer = {"id": None}
+    closed = {"done": False}
 
     def close(outcome):
+        if closed["done"]:
+            return
+        closed["done"] = True
         result["outcome"] = outcome
         if timer["id"] is not None:
             try:
@@ -936,14 +1445,15 @@ def _wait_window(seconds):
         except Exception:
             pass
 
-    tick()
     root.protocol("WM_DELETE_WINDOW", lambda: close("dismissed"))  # X = hide, keep waiting
     root.update_idletasks()
     x = (root.winfo_screenwidth() - root.winfo_width()) // 2
     y = (root.winfo_screenheight() - root.winfo_height()) // 3
     root.geometry("+%d+%d" % (x, y))
     root.lift()  # deliberately no focus_force: informational, not an alarm
-    root.mainloop()
+    tick()
+    if not closed["done"]:
+        root.mainloop()
     return result["outcome"], max(0.0, deadline - time.monotonic())
 
 
@@ -1260,8 +1770,11 @@ def alarm(message, buttons=("Acknowledge",)):
 
 
 def alarmOnError():
-    """Make any uncaught exception in the script raise alarm(), then exit 1."""
+    """Alarm on uncaught errors; allow Ctrl+C to exit without opening a dialog."""
     def _hook(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            _emit("Script interrupted by operator (Ctrl+C); stopping without an alarm")
+            return
         traceback.print_exception(exc_type, exc, tb)
         _log_write("".join(traceback.format_exception(exc_type, exc, tb)).rstrip())
         summary = "".join(traceback.format_exception_only(exc_type, exc)).strip()
@@ -1317,8 +1830,16 @@ def setViewport(width, height):
             pass
 
 
-def checkViewport(width, height):
-    """Alarm unless the live viewport matches the recorded size.
+def checkViewport(width=None, height=None):
+    """Check the active layout's viewport, offering to restore its saved size.
+
+    With no arguments, a mismatch offers Restore saved size, Check again,
+    or Stop the script. Restoration uses setViewport, then checks fresh
+    dimensions. There is no bypass and saved layout data is never changed.
+    A new layout binds its initial size as before. Per-action viewport
+    checks still raise immediately if the browser changes during a sequence.
+
+    With explicit width and height, retain the legacy recorded-size check.
 
     Recorded coordinates only line up when the browser window (and zoom)
     match record time, so a size mismatch would silently click the wrong
@@ -1326,6 +1847,39 @@ def checkViewport(width, height):
     setViewport to match the recording), Check again, Continue anyway, or
     Stop the script (exit code 2).
     """
+    if width is None and height is None:
+        selected = _require_layout()
+        restore_error = None
+        while True:
+            try:
+                selected.check_viewport(viewportSize())
+            except _layouts.ViewportMismatchError as exc:
+                message = (
+                    "%s\n\n'Restore saved size' resizes the browser to match this "
+                    "layout. 'Check again' checks after you adjust the window. "
+                    "The script will continue only when the dimensions match."
+                    % exc)
+            else:
+                return selected.viewport
+            if restore_error is not None:
+                message += "\n\nLast restore attempt failed: %s" % restore_error
+            choice = alarm(message, buttons=(
+                "Restore saved size", "Check again", "Stop the script"))
+            if choice == 0:
+                try:
+                    setViewport(*selected.viewport)
+                except Exception as exc:
+                    restore_error = str(exc)
+                    _emit("Could not restore saved viewport: %s" % exc)
+                else:
+                    restore_error = None
+            elif choice == 1:
+                _emit("Re-checking layout viewport...")
+            else:
+                _emit("Script stopped by operator")
+                sys.exit(2)
+    if width is None or height is None:
+        raise TypeError("checkViewport requires both width and height, or neither")
     while True:
         w, h = viewportSize()
         if (w, h) == (width, height):

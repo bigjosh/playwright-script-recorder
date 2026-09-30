@@ -1,2 +1,8 @@
+# Python 3.9 or newer, with tkinter.
+# On the 3.14 line use 3.14.7 or newer: 3.14.0-3.14.6 leak memory on every
+# Playwright call (CPython issue #152569, fixed in 3.14.7) -- a long replay
+# grows by roughly one screenshot per action.  See README, "Python version".
 playwright>=1.40
 Pillow>=10
+# Full-viewport popup matching for the optional pre-click guard (no OpenCV GUI).
+opencv-python-headless>=4.10
