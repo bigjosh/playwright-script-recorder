@@ -237,7 +237,7 @@ class LivePreviewVerificationTests(unittest.TestCase):
     def test_matching_live_preview_does_not_resume_or_bypass_operator_stop(self):
         self.capture.side_effect = [(self.mismatch, self.full), (self.expected, self.full)]
         self.viewer.side_effect = self.preview_matching_frame
-        self.alarm.side_effect = [1, 3]
+        self.alarm.side_effect = [1, 4]
         with self.assertRaises(SystemExit) as stopped:
             psl.verifyFrame("saved.png", self.box)
         self.assertEqual(stopped.exception.code, 2)
@@ -268,7 +268,7 @@ class LivePreviewVerificationTests(unittest.TestCase):
             (self.mismatch, self.full), (self.expected, self.full),
             (self.mismatch, self.full)]
         self.viewer.side_effect = self.preview_matching_frame
-        self.alarm.side_effect = [1, 0, 3]
+        self.alarm.side_effect = [1, 0, 4]
         with self.assertRaises(SystemExit) as stopped:
             psl.verifyFrame("saved.png", self.box)
         self.assertEqual(stopped.exception.code, 2)

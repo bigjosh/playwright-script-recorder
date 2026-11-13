@@ -25,9 +25,29 @@ class NamedRecorderTests(unittest.TestCase):
                     recorder.do_click(writer, double=double, named=True)
                 action = "doubleClick" if double else "click"
                 self.assertEqual(events, [("define", "alignment-tab"), (action, "alignment-tab")])
+                self.assertEqual(writer.action.call_args.kwargs, {"point": "alignment-tab"})
                 code = writer.action.call_args.args[-1]
                 self.assertEqual(code, "psl.%s('alignment-tab')" % action)
                 ast.parse(code)
+
+    def test_named_click_codegen_identifies_point_without_parsing_comment(self):
+        writer = recorder._WriterBase()
+        writer.note = mock.Mock()
+        writer.action("NEAR the execute button", "Click near-execute",
+                      "psl.click('near-execute')", point="near-execute")
+        tree = ast.parse("\n".join(writer.note.call_args.args))
+        info, click = (statement.value for statement in tree.body)
+        self.assertEqual(info.func.attr, "info")
+        self.assertEqual(info.keywords[0].arg, "point")
+        self.assertEqual(ast.literal_eval(info.keywords[0].value),
+                         ast.literal_eval(click.args[0]))
+
+    def test_nonpoint_codegen_keeps_plain_info(self):
+        writer = recorder._WriterBase()
+        writer.note = mock.Mock()
+        writer.action("", "Wait", "psl.wait(5)")
+        self.assertEqual(writer.note.call_args.args,
+                         ("psl.info('Wait')", "psl.wait(5)"))
 
     def test_canceled_definition_never_clicks_or_records(self):
         writer = mock.Mock()

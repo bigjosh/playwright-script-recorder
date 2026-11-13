@@ -88,6 +88,47 @@ Replacement definitions keep the previous files intact until the new
 definition is accepted and saved. Previous reference PNGs are retained when
 replaced; the entry JSON identifies the current one.
 
+To let an operator reassign a named click while single-stepping, attach the
+point name to the preceding info message. The recorder emits this metadata
+for newly recorded named clicks and double-clicks:
+
+```python
+psl.info('Click the alignment tab', point='alignment-tab')
+psl.click('alignment-tab')
+psl.info('Select X', point='x-field')
+psl.doubleClick('x-field')
+```
+
+With `pauseOnInfo(True)`, these pauses offer **Reassign click location**. Pick
+the new target on a frozen screenshot; it is saved without clicking the target,
+and the same step remains paused until **Next Step** or **Run Continuously**.
+Cancel/Escape/close in the picker leaves the old point and returns to the pause.
+Closing a point-aware step dialog (or console EOF) stops the script. Save or
+viewport/page/layout errors prevent the pending action. The point name must
+match the immediately following click/double-click; it is not inferred from
+the message text. Existing plain `info(message)` pauses keep their behavior,
+and continuous mode does not offer reassignment. The click's existing popup
+guard still runs immediately before input.
+
+On a failed `verifyFrame` comparison, choose **Recapture reference** to review
+and replace that reference. The old image is shown before capture, stays visible
+while selecting the new rectangle, and is shown beside the replacement during
+confirmation. Establish the correct expected state before choosing **Capture
+replacement**, then select the area and explicitly choose **Use as expected
+reference**. The named frame gets a new PNG and bounds; its previous PNG is
+retained. The script then takes a fresh screenshot and repeats the comparison
+with the same threshold, delay, and retry count. Saving a reference alone never
+passes the check. Cancel/Escape/close during recapture returns to the mismatch
+alarm without saving. Closing the alarm itself still stops the script.
+
+Only that verification frame changes: click points, OCR regions, and other
+frames are independent. For legacy path/box comparisons, recapture keeps the
+hardcoded rectangle and saves the previous PNG beside it as
+`<path>.before-recapture-<id>.png` before atomically replacing the reference.
+A viewport or page/layout change during recapture prevents acceptance; save
+errors stop the operation. Quiet `fallthru=True` comparisons still return False
+without offering any dialogs. Restart a running script to load library changes.
+
 Legacy numeric/path calls remain supported without choosing a layout, including
 `click(x, y)`, `doubleClick(x, y)`, `frameGrab(x1, y1, x2, y2)`, and
 `verifyFrame(path, box, matchLevel, message, ...)`. Explicit
@@ -190,6 +231,43 @@ Layout and screenshot errors propagate normally. Callers checking machine
 coordinates should parse the returned string and compare the values against
 their commanded positions and tolerance.
 
+### Review and redefine an OCR region
+
+Opt into the editable OCR workflow for a named region:
+
+```python
+text = psl.grabOCRTextLine("actual-xy", review=True)
+```
+
+With `pauseOnInfo(True)`, the current crop and recognized text are shown before
+the read returns. **Redefine OCR area** opens the frozen-screen rectangle
+picker. The proposed crop and its OCR result must be reviewed before **Save
+OCR area** commits the region bounds. There is no reference PNG. Cancel leaves
+the existing bounds and returns to the pending dialog. The same region name
+reuses the saved bounds on subsequent calls.
+
+Saving always returns to a paused preview, even when editing after a failure
+in continuous mode. **Next Step** or **Run Continuously** takes a fresh reading;
+it never returns the old preview as the accepted result. OCR read failures
+show **Retry**, **Redefine OCR area**, and **STOP** in either mode, with no skip.
+Retry repeats only the read, never the machine action that preceded it.
+Escape/window close stops a read or cancels an edit. A candidate whose OCR is
+empty, multiline, or failed cannot be saved; select again or cancel instead.
+If its image preview cannot be displayed, the edit stops without saving.
+
+For application-specific checks, pass `validator=check_reading`. The callback
+receives each fresh text string and rejects it by raising `psl.OCRError` or
+returning `False`. Other return values are ignored; the API still returns the
+text. `real-dwl.py` supplies its existing X/Y parser and +/-50 um position check.
+Candidate-area confirmation checks text readability only; accepting geometry
+does not bypass validation of the fresh reading before continuation.
+
+`review` defaults to False, keeping existing calls noninteractive and preserving
+exception behavior. Editable review requires a named region, not hardcoded
+numeric bounds. Tesseract setup, page/layout/viewport, screenshot, save, and
+unexpected validator failures propagate rather than entering the read-retry
+loop. No review/edit action sends clicks or keys to the controlled application.
+
 ## Setup
 
 Python 3.9 or newer with tkinter (included in the standard Windows
@@ -268,9 +346,14 @@ in the selected layout. Legacy captures still save `capture-immediate-...` PNGs.
   `wait()` in front of it. Whenever a delay or retries are in play, a
   quiet countdown window shows `Verifying frame / <name> / Try n of m in
   Xs`, a live `(N seconds until timeout)` estimate, and the last
-  similarity score, with **Try now** / **Abort verify** (returns False,
-  script continues) / **Abort script** (exit code 2) buttons; closing it
-  hides the window and the cycle continues silently. When a mismatch
+  similarity score, with **Try now** (skip this countdown), **Final compare
+  now** (check fresh pixels immediately and cancel remaining retries on a
+  mismatch), **Abort verify** (returns False, script continues), and **Abort
+  script** (exit code 2) buttons. **Final compare now** still passes a matching
+  image normally; a mismatch opens the usual alarm with **Recapture reference**
+  available. **Try compare again** and a saved replacement restart the original
+  delay and retry count. Closing the countdown window hides it and the cycle
+  continues silently. When a mismatch
   should not stop anyone, add `fallthru=True` to the generated
   `psl.verifyFrame(...)` call by hand (the recorder never emits it): the
   test then just logs the miss and returns `False` for your own code to
@@ -330,7 +413,7 @@ including your recorded comment:
 ```
 
 When a screen test fails, the script pops an always-on-top red window,
-beeps loudly, and offers four choices:
+beeps loudly, and offers five choices:
 
 - **Try compare again** — e.g. after you manually put the target page back
   into the right state
@@ -357,6 +440,9 @@ beeps loudly, and offers four choices:
   display available it saves `compare-diff-*.png` files instead (including
   the boxed full-frame context) and prints their paths.
 - **Skip and continue** — accept the mismatch and resume the script
+- **Recapture reference** — review the old image, select and confirm a new
+  reference, then check fresh pixels with the original comparison settings.
+  Cancelling keeps the original reference and returns to this alarm.
 - **Stop the script** — abort immediately (exit code 2)
 
 Live capture requests time out after two seconds. On capture failure, the

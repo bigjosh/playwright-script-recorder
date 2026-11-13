@@ -33,10 +33,13 @@ import io
 import math
 import os
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import traceback
+import uuid
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 from playwright.sync_api import sync_playwright
@@ -505,7 +508,128 @@ def frameGrab(x1, y1=None, x2=None, y2=None):
     return _frame_and_full(x1, y1, x2, y2)[0]
 
 
-def grabOCRTextLine(x1, y1=None, x2=None, y2=None, *, tesseract_cmd=None):
+def _check_ocr_text(text, validator=None):
+    text = text.strip()
+    if not text:
+        raise OCRError("OCR returned no text for the selected rectangle.")
+    if len(text.splitlines()) != 1:
+        raise OCRError("OCR returned multiple lines; select a rectangle containing one text line.")
+    if validator is not None and validator(text) is False:
+        raise OCRError("OCR text did not pass validation.")
+    return text
+
+
+def _ocr_preview(reader, pixels, validator=None):
+    """Keep the recognized text available even when its validation fails."""
+    text = ""
+    try:
+        text = reader(pixels).strip()
+        return _check_ocr_text(text, validator), None
+    except OCRError as exc:
+        return text, str(exc)
+
+
+def _ocr_choice(name, pixels, text, *, error=None, buttons, require_preview=False):
+    try:
+        return _layouts.ocr_dialog(name, pixels, text, error=error, buttons=buttons)
+    except Exception:
+        if require_preview:
+            # Saving geometry requires seeing the candidate crop, not just its
+            # OCR text in a console after an image-dialog failure.
+            raise
+        message = "OCR '%s': %r%s" % (name, text, "\n" + error if error else "")
+        _emit(message)
+        return _pause_console(message, buttons, close_choice=len(buttons) - 1)
+
+
+def _edit_ocr_region(name, reader, check_context):
+    """Preview a proposed region and its OCR before atomically saving bounds."""
+    selected = _require_layout()
+    path = selected._entry_path(name)
+    if path.exists():
+        selected._validate(name, "region", _layouts._read_json(path))
+    while True:
+        check_context()
+        screenshot = viewportGrab()
+        selected.check_viewport(screenshot.size)
+        box = _layouts.pick_on_image(screenshot, "Redefine OCR area '%s'" % name, "rect")
+        if box is None:
+            raise _layouts.LayoutCancelled()
+        entry = {"version": 1, "kind": "region", "box": list(box)}
+        selected._validate(name, "region", entry)
+        crop = screenshot.crop(tuple(box))
+        # Confirm readable text and geometry here. The caller's value checks
+        # run on a fresh reading after the operator leaves the paused step.
+        text, error = _ocr_preview(reader, crop)
+        buttons = (("Select again", "Cancel") if error is not None else
+                   ("Save OCR area", "Select again", "Cancel"))
+        choice = _ocr_choice(name, crop, text, error=error, buttons=buttons,
+                             require_preview=True)
+        if error is None and choice == 0:
+            check_context()
+            _layouts._write_json(path, entry)
+            _emit("Saved OCR area '%s' at %s; the reading still requires a fresh check"
+                  % (name, tuple(box)))
+            return tuple(box)
+        if choice == (0 if error is not None else 1):
+            continue
+        raise _layouts.LayoutCancelled()
+
+
+def _review_ocr_text_line(name, reader, validator):
+    """Read/review/redefine without ever replaying the action before this read."""
+    global _pause_on_info
+    page = _require_page()
+    selected = _require_layout()
+    expected_viewport = viewportSize()
+    needs_pause = _pause_on_info
+
+    def check_context():
+        if _page is not page or _layout is not selected:
+            raise _layouts.LayoutError("The page or layout changed during OCR review.")
+        if viewportSize() != expected_viewport:
+            raise _layouts.LayoutError("The viewport changed during OCR review.")
+        selected.check_viewport(expected_viewport)
+
+    while True:
+        check_context()
+        pixels = frameGrab(name)
+        check_context()
+        text, error = _ocr_preview(reader, pixels, validator)
+        check_context()
+        _emit("OCR '%s': %r%s" % (name, text, " -- " + error if error else ""))
+        if error is None and not needs_pause:
+            return text
+        while True:
+            buttons = (("Retry", "Redefine OCR area", "STOP") if error is not None else
+                       ("Next Step", "Run Continuously", "Redefine OCR area", "STOP"))
+            choice = _ocr_choice(name, pixels, text, error=error, buttons=buttons)
+            redefine_choice = 1 if error is not None else 2
+            if choice == redefine_choice:
+                try:
+                    _edit_ocr_region(name, reader, check_context)
+                except _layouts.LayoutCancelled:
+                    _emit("OCR area edit cancelled; the pending read remains paused")
+                    continue
+                # Saving never resumes the script, even if the failed read was
+                # in continuous mode. Show a new paused preview first.
+                needs_pause = True
+                break
+            if choice == 0:
+                if error is None:
+                    needs_pause = False
+                # Retry and Next both take fresh pixels, OCR and validation.
+                break
+            if error is None and choice == 1:
+                _pause_on_info = False
+                needs_pause = False
+                break
+            _emit("OCR check stopped by operator")
+            raise SystemExit(2)
+
+
+def grabOCRTextLine(x1, y1=None, x2=None, y2=None, *, tesseract_cmd=None,
+                    review=False, validator=None):
     """Capture a named layout region and return its text as one string.
 
     Like frameGrab(), accepts either a region name or four rectangle
@@ -519,18 +643,30 @@ def grabOCRTextLine(x1, y1=None, x2=None, y2=None, *, tesseract_cmd=None):
 
     Leading/trailing whitespace is removed; internal spacing, signs, decimal
     points and other recognized characters are preserved. This function does
-    not parse or validate values. Raises OCRError for OCR setup/execution
-    failures, no text, or unexpected multiple lines. Layout/capture errors
-    propagate just as they do in frameGrab().
+    not parse values itself. Optional validator(text) must raise OCRError or
+    return False to reject a reading; its other return values are ignored.
+
+    review=True requires a named region. In step mode it shows the current
+    crop/text and offers Next Step, Run Continuously, Redefine OCR area, STOP.
+    OCR/validation failures offer Retry, Redefine OCR area, STOP in either
+    mode. An edit previews OCR before saving only the region bounds and
+    returns to a paused preview. Next always reads and validates fresh pixels.
+    Cancel leaves old bounds and the pending dialog intact. No action is
+    replayed, and no error can be skipped into a successful return.
+
+    Without review, OCR failures raise as before. OCR setup, layout, capture,
+    save and unexpected validator errors always propagate; only OCRError from
+    reading/validation enters interactive recovery.
     """
+    if validator is not None and not callable(validator):
+        raise TypeError("validator must be callable")
+    if review and not (isinstance(x1, str) and y1 is None and x2 is None and y2 is None):
+        raise TypeError("OCR review requires a named layout region")
     reader = _ocr.TesseractReader(tesseract_cmd)
+    if review:
+        return _review_ocr_text_line(x1, reader, validator)
     pixels = frameGrab(x1, y1, x2, y2)
-    text = reader(pixels).strip()
-    if not text:
-        raise OCRError("OCR returned no text for the selected rectangle.")
-    if len(text.splitlines()) != 1:
-        raise OCRError("OCR returned multiple lines; select a rectangle containing one text line.")
-    return text
+    return _check_ocr_text(reader(pixels), validator)
 
 
 def loadFrame(path):
@@ -1098,6 +1234,7 @@ class _VerifyPopup:
 
     Shows "Verifying frame / <name> / Try n of m in Xs" plus the last
     similarity score.  Buttons: "Try now" skips the current countdown,
+    "Final compare now" checks once immediately and ends retries on a miss,
     "Abort verify" gives up on this screen test (verifyFrame returns
     False), "Abort script" exits with code 2.  Closing the window hides
     it and the verify continues silently.
@@ -1130,6 +1267,7 @@ class _VerifyPopup:
         row = tk.Frame(root, bg=bg)
         row.pack(padx=30, pady=(4, 18))
         for label, action in (("Try now", "trynow"),
+                              ("Final compare now", "finalnow"),
                               ("Abort verify", "abortverify"),
                               ("Abort script", "abortscript")):
             tk.Button(row, text=label, font=("Segoe UI", 11, "bold"),
@@ -1167,7 +1305,7 @@ class _VerifyPopup:
 
     def countdown(self, seconds, attempt, total):
         """Pump the window for `seconds` before attempt n of m.  Returns
-        'trynow', 'abortverify', 'abortscript', or None (time elapsed)."""
+        'trynow', 'finalnow', 'abortverify', 'abortscript', or None (time elapsed)."""
         deadline = time.monotonic() + max(0.0, seconds)
         if self.hidden:
             remaining = deadline - time.monotonic()
@@ -1204,6 +1342,7 @@ class _VerifyPopup:
         return action
 
     def note_grab(self, attempt, total):
+        """Update status and consume any button pressed during this UI pump."""
         if self.hidden:
             return
         try:
@@ -1211,6 +1350,9 @@ class _VerifyPopup:
             self.root.update()
         except Exception:
             self.hidden = True
+        action = self.action
+        self.action = None
+        return action
 
     def note_score(self, text):
         if self.hidden:
@@ -1230,6 +1372,80 @@ class _VerifyPopup:
         self.hidden = True
 
 
+def _replace_reference_png(path, crop):
+    """Keep the previous PNG and atomically replace a legacy reference."""
+    path = os.path.abspath(os.fspath(path))
+    backup = path + ".before-recapture-" + uuid.uuid4().hex + ".png"
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=os.path.dirname(path),
+                                         prefix=".reference-", suffix=".tmp",
+                                         delete=False) as stream:
+            temporary = stream.name
+            crop.save(stream, format="PNG")
+            stream.flush()
+            os.fsync(stream.fileno())
+        shutil.copy2(path, backup)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)
+    return backup
+
+
+def _recapture_reference(layout_name, path, box, previous):
+    """Operator-reviewed replacement; no input is sent to the target page.
+
+    Named references may move or resize. Legacy boxes live in the caller's
+    source code, so their replacements must keep the same capture rectangle.
+    LayoutCancelled is handled by verifyFrame, returning to its failed check.
+    """
+    page = _require_page()
+    selected = _require_layout() if layout_name is not None else _layout
+    expected_viewport = viewportSize()
+
+    def check_context():
+        if _page is not page or _layout is not selected:
+            raise _layouts.LayoutError("The page or layout changed during recapture.")
+        if viewportSize() != expected_viewport:
+            raise _layouts.LayoutError("The viewport changed during recapture; reference not accepted.")
+        if layout_name is not None:
+            selected.check_viewport(expected_viewport)
+
+    def grab():
+        check_context()
+        shot = viewportGrab()
+        if shot.size != expected_viewport:
+            raise _layouts.LayoutError("The capture size changed during recapture.")
+        return shot
+
+    if layout_name is not None:
+        check_context()
+        entry = selected.define(layout_name, "frame", grab,
+                                previous=previous, before_commit=check_context)
+        check_context()
+        _emit("Recaptured reference '%s': %s at %s (previous PNG retained: %s)"
+              % (layout_name, entry["image"], tuple(entry["box"]), path))
+        return entry["image"], tuple(entry["box"])
+
+    name = os.path.basename(os.fspath(path))
+    if not _layouts.prompt_recapture(name, previous, fixed_box=box):
+        raise _layouts.LayoutCancelled()
+    shot = grab()
+    x1, y1, x2, y2 = box
+    if (x1 < 0 or y1 < 0 or x2 <= x1 or y2 <= y1
+            or x2 > shot.width or y2 > shot.height):
+        raise _layouts.LayoutError("The reference rectangle is outside the capture.")
+    crop = shot.crop(box)
+    if not _layouts.confirm_reference(name, crop, previous=previous):
+        raise _layouts.LayoutCancelled()
+    check_context()
+    backup = _replace_reference_png(path, crop)
+    _emit("Recaptured reference %s at %s (previous PNG retained: %s)"
+          % (path, box, backup))
+    return path, box
+
+
 def verifyFrame(baselinePath, box=None, matchLevel=0.98, message=None, delay=0, retrycount=0,
                 fallthru=False):
     """Compare a named layout frame, or a legacy explicit PNG and rectangle.
@@ -1241,7 +1457,7 @@ def verifyFrame(baselinePath, box=None, matchLevel=0.98, message=None, delay=0, 
     explicitly accept a preview before saving. Canceling definition stops.
 
     box is (x1, y1, x2, y2) -- the region the capture was taken from.  On a
-    mismatch a loud alarm is raised offering the operator four choices
+    mismatch a loud alarm is raised offering the operator five choices
     (unless fallthru=True, see below):
 
       1. Try compare again -- e.g. after manually putting the target page
@@ -1253,7 +1469,12 @@ def verifyFrame(baselinePath, box=None, matchLevel=0.98, message=None, delay=0, 
          Try compare again to recheck; live preview never resumes execution.
          Saves diff PNGs instead when there is no display.
       3. Skip and continue -- accept the mismatch and resume the script
-      4. Stop the script   -- abort immediately (exit code 2)
+      4. Recapture reference -- show the old reference, select and explicitly
+         accept a replacement, then rerun the live check with the same options.
+         Named frames save new bounds and retain the previous PNG. Legacy
+         path/box calls keep their hardcoded bounds and back up the old PNG.
+         Cancel returns to this alarm without saving or passing the check.
+      5. Stop the script   -- abort immediately (exit code 2)
 
     delay is seconds to sleep before each grab (0 = grab immediately);
     retrycount is how many tries before raising the alarm (0 and 1 both
@@ -1262,8 +1483,10 @@ def verifyFrame(baselinePath, box=None, matchLevel=0.98, message=None, delay=0, 
     never matched within ~15 minutes -- usually better than a long fixed
     wait().  Whenever a delay or retries are in play, a quiet countdown
     window shows "Verifying frame / <name> / Try n of m in Xs" with the
-    last similarity score and three buttons: "Try now" (skip the current
-    countdown), "Abort verify" (give up on this test; returns False), and
+    last similarity score and four buttons: "Try now" (skip the current
+    countdown), "Final compare now" (one fresh comparison immediately, then
+    the normal mismatch handling on failure with no remaining retries),
+    "Abort verify" (give up on this test; returns False), and
     "Abort script" (exit code 2); closing the window hides it and the
     cycle continues silently.  Instant single-try verifies show no
     window.  A match on a later attempt logs which attempt succeeded, and
@@ -1306,6 +1529,8 @@ def verifyFrame(baselinePath, box=None, matchLevel=0.98, message=None, delay=0, 
             except Exception:
                 popup = None
         outcome = None
+        checks_done = 0
+        final_requested = False
         try:
             for attempt in range(1, attempts + 1):
                 action = None
@@ -1317,13 +1542,22 @@ def verifyFrame(baselinePath, box=None, matchLevel=0.98, message=None, delay=0, 
                     outcome = action
                     break
                 if popup is not None:
-                    popup.note_grab(attempt, attempts)
+                    pending_action = popup.note_grab(attempt, attempts)
+                    if pending_action in ("abortverify", "abortscript"):
+                        outcome = pending_action
+                        break
+                    if pending_action == "finalnow":
+                        action = pending_action
+                final_requested = action == "finalnow"
+                if final_requested:
+                    _emit("Final comparison requested; checking fresh pixels now")
                 if named:
                     layoutViewport()
                 fresh, full = _frame_and_full(x1, y1, x2, y2)
                 if named:
                     _require_layout().check_viewport(full.size)
                 score = frameSimilarity(baseline, fresh)
+                checks_done += 1
                 if score >= matchLevel:
                     if attempt > 1:
                         _emit("[%s] Screen test matched on attempt %d/%d (similarity %.4f)"
@@ -1333,6 +1567,8 @@ def verifyFrame(baselinePath, box=None, matchLevel=0.98, message=None, delay=0, 
                 if popup is not None:
                     popup.note_score("last similarity %.4f (needs at least %s)"
                                      % (score, matchLevel))
+                if final_requested:
+                    break
         finally:
             if popup is not None:
                 popup.close()
@@ -1347,16 +1583,32 @@ def verifyFrame(baselinePath, box=None, matchLevel=0.98, message=None, delay=0, 
             sys.exit(2)
         if attempts > 1:
             detail = ("%s  (similarity %.4f after %d tries, needs at least %s)"
-                      % (message, score, attempts, matchLevel))
+                      % (message, score, checks_done, matchLevel))
         else:
             detail = "%s  (similarity %.4f, needs at least %s)" % (message, score, matchLevel)
+        if final_requested:
+            detail += " -- Final comparison requested; remaining retries cancelled."
         if fallthru:
             _emit("[%s] Screen test '%s' did not match -- falling through: %s"
                   % (time.strftime("%H:%M:%S"), display_name, detail))
             return False
         while True:
             choice = alarm(detail, buttons=("Try compare again", "Show differences",
-                                            "Skip and continue", "Stop the script"))
+                                            "Skip and continue", "Recapture reference",
+                                            "Stop the script"))
+            if choice == 3:
+                try:
+                    replacement_path, replacement_box = _recapture_reference(
+                        layout_name, baselinePath, region, baseline)
+                except _layouts.LayoutCancelled:
+                    _emit("Reference recapture cancelled; original comparison still pending")
+                    continue
+                baseline = loadFrame(replacement_path)
+                baselinePath = replacement_path
+                x1, y1, x2, y2 = replacement_box
+                region = tuple(replacement_box)
+                _emit("Reference saved; checking a fresh capture before continuing")
+                break
             if choice != 1:
                 break
             try:
@@ -1373,8 +1625,9 @@ def verifyFrame(baselinePath, box=None, matchLevel=0.98, message=None, delay=0, 
                         info("Saved %s" % path)
                 except Exception as e:
                     info("Could not create diff images: %s" % e)
-        if choice == 0:
-            info("Retrying compare...")
+        if choice in (0, 3):
+            if choice == 0:
+                info("Retrying compare...")
             continue
         if choice == 2:
             info("Compare skipped by operator")
@@ -1488,18 +1741,26 @@ def wait(seconds):
         time.sleep(remaining)
 
 
-def info(message):
+def info(message, *, point=None):
     """Print a timestamped progress line; recorded scripts call this before
     each action so the console shows what is happening and when.
 
     With screenshotOnInfo(True) active, each info line also saves a full
     screenshot; with pauseOnInfo(True) active, it pauses the script until
-    the operator chooses how to proceed."""
+    the operator chooses how to proceed. Supply point="name" immediately
+    before a named click/doubleClick to offer location reassignment while
+    paused. Reassignment saves the point but does not send a click.
+    """
+    if point is not None:
+        _layouts.validate_name(point)
     _emit("[%s] %s" % (time.strftime("%H:%M:%S"), message))
     if _shot_dir is not None:
         _snap_info(message)
     if _pause_on_info:
-        _step_pause(message)
+        if point is None:
+            _step_pause(message)
+        else:
+            _step_pause(message, point=point)
 
 
 def screenshotOnInfo(enabled, folder=None):
@@ -1565,11 +1826,15 @@ def pauseOnInfo(enabled):
       Run Continuously -- turn stepping off and let the script run normally
       STOP             -- abort the script immediately (exit code 2)
 
+    A named click's info(message, point="name") adds Reassign click location.
+    Saving or canceling that edit returns to the same pause; Next Step or
+    Run Continuously is still required before the pending action. Closing a
+    named-click pause, or console EOF, stops instead of sending that click.
+
     The recorder writes an info() line before every action, so this steps
-    through a script action by action.  Closing the popup (or console EOF
-    when there is no display) counts as Run Continuously, so an accidental
-    close never kills the script; the console fallback treats a plain
-    Enter as Next Step.
+    through a script action by action. For ordinary info() calls without
+    point metadata, closing the popup or console EOF retains the existing
+    Run Continuously behavior. Plain console Enter selects Next Step.
     """
     global _pause_on_info
     _pause_on_info = bool(enabled)
@@ -1577,64 +1842,118 @@ def pauseOnInfo(enabled):
                                  "on -- pausing at every step" if enabled else "off"))
 
 
-def _step_pause(message):
+def _reassign_point(name):
+    """Select and save a named click position without sending target input."""
+    _layouts.validate_name(name)
+    page = _require_page()
+    selected = _require_layout()
+    expected_viewport = viewportSize()
+
+    def check_context():
+        if _page is not page or _layout is not selected:
+            raise _layouts.LayoutError("The page or layout changed during click reassignment.")
+        if viewportSize() != expected_viewport:
+            raise _layouts.LayoutError("The viewport changed during click reassignment; point not saved.")
+        selected.check_viewport(expected_viewport)
+
+    def grab():
+        check_context()
+        screenshot = viewportGrab()
+        if screenshot.size != expected_viewport:
+            raise _layouts.LayoutError("The capture size changed during click reassignment.")
+        return screenshot
+
+    check_context()
+    path = selected._entry_path(name)
+    if path.exists():
+        # Metadata on the pause must not overwrite an unrelated frame/region.
+        selected._validate(name, "point", _layouts._read_json(path))
+    entry = selected.define(name, "point", grab, prompt=False, before_commit=check_context)
+    check_context()
+    _emit("Reassigned click location '%s' to (%d, %d); waiting for the next-step choice"
+          % (name, entry["x"], entry["y"]))
+    return entry["x"], entry["y"]
+
+
+def _step_pause(message, *, point=None):
     global _pause_on_info
-    buttons = ("Next Step", "Run Continuously", "STOP")
-    try:
-        choice = _pause_window(message, buttons)
-    except Exception:
-        choice = _pause_console(message, buttons)
-    if choice == 0:
-        return
-    if choice == 1:
-        _pause_on_info = False
-        _emit("[%s] Running continuously -- step mode off" % time.strftime("%H:%M:%S"))
-        return
-    _emit("[%s] Script stopped by operator (step mode)" % time.strftime("%H:%M:%S"))
-    sys.exit(2)
+    if point is None:
+        buttons = ("Next Step", "Run Continuously", "STOP")
+        options = {}
+    else:
+        _layouts.validate_name(point)
+        buttons = ("Next Step", "Run Continuously", "Reassign click location", "STOP")
+        options = {"close_choice": len(buttons) - 1}
+        message = "%s\n\nClick location: %s" % (message, point)
+    while True:
+        try:
+            choice = _pause_window(message, buttons, **options)
+        except Exception:
+            choice = _pause_console(message, buttons, **options)
+        if point is not None and choice == 2:
+            try:
+                _reassign_point(point)
+            except _layouts.LayoutCancelled:
+                _emit("Click reassignment cancelled; the pending step remains paused")
+            continue
+        if choice == 0:
+            return
+        if choice == 1:
+            _pause_on_info = False
+            _emit("[%s] Running continuously -- step mode off" % time.strftime("%H:%M:%S"))
+            return
+        _emit("[%s] Script stopped by operator (step mode)" % time.strftime("%H:%M:%S"))
+        sys.exit(2)
 
 
-def _pause_window(message, buttons):
+def _pause_window(message, buttons, *, close_choice=None):
     import tkinter as tk
 
-    result = {"choice": 1}  # closing the window = Run Continuously
+    result = {"choice": 1 if close_choice is None else close_choice}
     root = tk.Tk()
-    root.title("Step mode -- script paused")
-    root.configure(bg="#1f4e79")
-    root.attributes("-topmost", True)
-    tk.Label(root, text="⏸ PAUSED", font=("Segoe UI", 24, "bold"),
-             fg="white", bg="#1f4e79").pack(padx=40, pady=(24, 8))
-    tk.Label(root, text=message, font=("Segoe UI", 14), fg="white",
-             bg="#1f4e79", wraplength=640, justify="center").pack(padx=40, pady=8)
+    try:
+        root.title("Step mode -- script paused")
+        root.configure(bg="#1f4e79")
+        root.attributes("-topmost", True)
+        tk.Label(root, text="⏸ PAUSED", font=("Segoe UI", 24, "bold"),
+                 fg="white", bg="#1f4e79").pack(padx=40, pady=(24, 8))
+        tk.Label(root, text=message, font=("Segoe UI", 14), fg="white",
+                 bg="#1f4e79", wraplength=640, justify="center").pack(padx=40, pady=8)
 
-    def pick(index):
-        result["choice"] = index
-        root.destroy()
+        def pick(index):
+            result["choice"] = index
+            root.destroy()
 
-    row = tk.Frame(root, bg="#1f4e79")
-    row.pack(padx=30, pady=(8, 24))
-    for i, label in enumerate(buttons):
-        tk.Button(row, text=label, font=("Segoe UI", 12, "bold"),
-                  command=lambda i=i: pick(i), padx=16, pady=6).pack(side="left", padx=8)
-    root.protocol("WM_DELETE_WINDOW", root.destroy)
-    root.update_idletasks()
-    x = (root.winfo_screenwidth() - root.winfo_width()) // 2
-    y = (root.winfo_screenheight() - root.winfo_height()) // 3
-    root.geometry("+%d+%d" % (x, y))
-    root.lift()
-    root.focus_force()
-    root.mainloop()
-    return result["choice"]
+        row = tk.Frame(root, bg="#1f4e79")
+        row.pack(padx=30, pady=(8, 24))
+        for i, label in enumerate(buttons):
+            tk.Button(row, text=label, font=("Segoe UI", 12, "bold"),
+                      command=lambda i=i: pick(i), padx=16, pady=6).pack(side="left", padx=8)
+        root.protocol("WM_DELETE_WINDOW", root.destroy)
+        root.bind("<Escape>", lambda event: root.destroy())
+        root.update_idletasks()
+        x = (root.winfo_screenwidth() - root.winfo_width()) // 2
+        y = (root.winfo_screenheight() - root.winfo_height()) // 3
+        root.geometry("+%d+%d" % (x, y))
+        root.lift()
+        root.focus_force()
+        root.mainloop()
+        return result["choice"]
+    finally:
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
 
 
-def _pause_console(message, buttons):
+def _pause_console(message, buttons, *, close_choice=None):
     for i, label in enumerate(buttons, 1):
         print("  %d. %s" % (i, label), flush=True)
     while True:
         try:
             s = input("*** Paused -- choose 1-%d [1]: " % len(buttons)).strip()
         except EOFError:
-            return 1  # nobody at the console -> run continuously
+            return 1 if close_choice is None else close_choice
         if not s:
             return 0  # plain Enter steps to the next info line
         if s.isdigit() and 1 <= int(s) <= len(buttons):

@@ -71,12 +71,15 @@ over "localhost": localhost can resolve to IPv6, which Chrome does not bind.
 class _WriterBase:
     """Shared codegen: turns an action into its comment/info/code block."""
 
-    def action(self, comment, info_text, *code_lines):
+    def action(self, comment, info_text, *code_lines, point=None):
         message = info_text + (" -- " + comment if comment else "")
         body = []
         if comment:
             body.append("# " + comment)
-        body.append("psl.info(%r)" % message)
+        if point is None:
+            body.append("psl.info(%r)" % message)
+        else:
+            body.append("psl.info(%r, point=%r)" % (message, point))
         body.extend(code_lines)
         self.note(*body)
 
@@ -159,7 +162,7 @@ def do_click(writer, double, named=False):
         action = psl.doubleClick if double else psl.click
         action(name)
         writer.action(comment, "%s '%s'" % (label, name),
-                      "psl.%s(%r)" % ("doubleClick" if double else "click", name))
+                      "psl.%s(%r)" % ("doubleClick" if double else "click", name), point=name)
         print("%s performed and recorded using layout point '%s'." % (label, name))
         return
     print("Taking screenshot -- pick the %s position..." % label.lower())
