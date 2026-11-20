@@ -170,13 +170,20 @@ class Layout:
                 entry = dict(entry, image=str(target))
         return entry
 
-    def resolve(self, name, kind, grab):
-        """Load a valid entry, or ask the operator to define a missing entry."""
+    def saved_entry(self, name, kind):
+        """Read and validate an existing entry, returning None if it is missing."""
         path = self._entry_path(name)
         if kind not in ("point", "region", "frame"):
             raise LayoutError("Unknown layout entry kind %r." % kind)
         if path.exists():
             return self._validate(name, kind, _read_json(path))
+        return None
+
+    def resolve(self, name, kind, grab):
+        """Load a valid entry, or ask the operator to define a missing entry."""
+        entry = self.saved_entry(name, kind)
+        if entry is not None:
+            return entry
         return self.define(name, kind, grab)
 
     def define(self, name, kind, grab, *, previous=None, before_commit=None, prompt=True):
@@ -365,6 +372,62 @@ def _image_preview(parent, img, *, max_width, max_height):
     canvas.create_image(0, 0, image=photo, anchor="nw")
     canvas.image = photo
     return frame
+
+
+def show_click_preview(name, img, point):
+    """Show the pending click on a frozen screenshot, then return to the pause."""
+    import tkinter as tk
+    from PIL import ImageTk
+    if not isinstance(img, Image.Image) or min(img.size) <= 0:
+        raise LayoutError("Click preview requires a nonempty screenshot.")
+    if (not _integers(point, 2) or not 0 <= point[0] < img.width
+            or not 0 <= point[1] < img.height):
+        raise LayoutError("Click target %r is outside the screenshot." % (point,))
+    x, y = point
+    root = _root("Click preview — %s" % name)
+
+    def show_marked(view, cx, cy):
+        canvas = tk.Canvas(root, width=view.width, height=view.height, highlightthickness=0)
+        canvas.pack(padx=8)
+        canvas.image = ImageTk.PhotoImage(view, master=root)
+        canvas.create_image(0, 0, image=canvas.image, anchor="nw")
+        # Leave the center open so the operator can see the exact target.
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            line = (cx + 5 * dx, cy + 5 * dy, cx + 20 * dx, cy + 20 * dy)
+            canvas.create_line(*line, fill="black", width=5)
+            canvas.create_line(*line, fill="yellow", width=2)
+
+    try:
+        root.resizable(False, False)
+        max_width = max(1, int(root.winfo_screenwidth() * 0.9))
+        screen_height = root.winfo_screenheight()
+        tk.Label(root, text="%s   (x=%d, y=%d)" % (name, x, y), wraplength=max_width,
+                 font=("Segoe UI", 12, "bold")).pack(padx=8, pady=4)
+        overview = img.copy()
+        overview.thumbnail((max_width, max(1, int(screen_height * 0.55))), Image.LANCZOS)
+        show_marked(overview, int((x + 0.5) * overview.width / img.width),
+                    int((y + 0.5) * overview.height / img.height))
+
+        tk.Label(root, text="Click target at 3×").pack(pady=(6, 2))
+        # Pad at viewport edges to keep the clicked pixel centered even in a corner.
+        half_width = max(0, min(96, (max_width // 3 - 1) // 2))
+        half_height = max(0, min(24, (int(screen_height * 0.16) // 3 - 1) // 2))
+        detail = Image.new("RGB", (2 * half_width + 1, 2 * half_height + 1), "#555555")
+        detail.paste(img, (half_width - x, half_height - y))
+        detail = detail.resize((detail.width * 3, detail.height * 3), Image.NEAREST)
+        show_marked(detail, detail.width // 2, detail.height // 2)
+
+        tk.Button(root, text="Back to step", command=root.destroy).pack(pady=6)
+        root.bind("<Escape>", lambda event: root.destroy())
+        root.protocol("WM_DELETE_WINDOW", root.destroy)
+        root.lift()
+        root.focus_force()
+        root.wait_window(root)
+    finally:
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
 
 
 def ocr_dialog(name, crop, text, *, error=None,

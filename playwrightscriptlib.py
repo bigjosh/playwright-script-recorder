@@ -1748,8 +1748,8 @@ def info(message, *, point=None):
     With screenshotOnInfo(True) active, each info line also saves a full
     screenshot; with pauseOnInfo(True) active, it pauses the script until
     the operator chooses how to proceed. Supply point="name" immediately
-    before a named click/doubleClick to offer location reassignment while
-    paused. Reassignment saves the point but does not send a click.
+    before a named click/doubleClick to preview or reassign its location
+    while paused.
     """
     if point is not None:
         _layouts.validate_name(point)
@@ -1826,9 +1826,10 @@ def pauseOnInfo(enabled):
       Run Continuously -- turn stepping off and let the script run normally
       STOP             -- abort the script immediately (exit code 2)
 
-    A named click's info(message, point="name") adds Reassign click location.
-    Saving or canceling that edit returns to the same pause; Next Step or
-    Run Continuously is still required before the pending action. Closing a
+    A named click's info(message, point="name") adds Show click location
+    and Reassign click location. The preview marks the saved point on a
+    fresh screenshot. Both tools return to the same pause. Choose Next Step
+    or Run Continuously to proceed with the pending action. Closing a
     named-click pause, or console EOF, stops instead of sending that click.
 
     The recorder writes an info() line before every action, so this steps
@@ -1864,15 +1865,31 @@ def _reassign_point(name):
         return screenshot
 
     check_context()
-    path = selected._entry_path(name)
-    if path.exists():
-        # Metadata on the pause must not overwrite an unrelated frame/region.
-        selected._validate(name, "point", _layouts._read_json(path))
+    # Validate any existing entry before offering to replace its coordinates.
+    selected.saved_entry(name, "point")
     entry = selected.define(name, "point", grab, prompt=False, before_commit=check_context)
     check_context()
     _emit("Reassigned click location '%s' to (%d, %d); waiting for the next-step choice"
           % (name, entry["x"], entry["y"]))
     return entry["x"], entry["y"]
+
+
+def _preview_click_location(name):
+    """Show the saved click target on a fresh screenshot of the selected page."""
+    selected = _require_layout()
+    entry = selected.saved_entry(name, "point")
+    if entry is None:
+        raise _layouts.LayoutError(
+            "No saved click location for %r. Choose Reassign click location to define it." % name)
+    page = _require_page()
+    expected_size = selected.check_viewport(viewportSize())
+    screenshot = viewportGrab()
+    if _page is not page or _layout is not selected:
+        raise _layouts.LayoutError("The page or layout changed during the preview capture.")
+    selected.check_viewport(viewportSize())
+    if screenshot.size != expected_size:
+        raise _layouts.LayoutError("The screenshot size does not match the layout viewport.")
+    _layouts.show_click_preview(name, screenshot, (entry["x"], entry["y"]))
 
 
 def _step_pause(message, *, point=None):
@@ -1882,19 +1899,30 @@ def _step_pause(message, *, point=None):
         options = {}
     else:
         _layouts.validate_name(point)
-        buttons = ("Next Step", "Run Continuously", "Reassign click location", "STOP")
+        buttons = ("Next Step", "Run Continuously", "Reassign click location",
+                   "Show click location", "STOP")
         options = {"close_choice": len(buttons) - 1}
         message = "%s\n\nClick location: %s" % (message, point)
+    prompt = message
     while True:
         try:
-            choice = _pause_window(message, buttons, **options)
+            choice = _pause_window(prompt, buttons, **options)
         except Exception:
-            choice = _pause_console(message, buttons, **options)
+            choice = _pause_console(prompt, buttons, **options)
+        prompt = message
         if point is not None and choice == 2:
             try:
                 _reassign_point(point)
             except _layouts.LayoutCancelled:
                 _emit("Click reassignment cancelled; the pending step remains paused")
+            continue
+        if point is not None and choice == 3:
+            try:
+                _preview_click_location(point)
+            except Exception as exc:
+                error = "Could not preview click location: %s" % exc
+                _emit(error)
+                prompt = "%s\n\n%s" % (message, error)
             continue
         if choice == 0:
             return

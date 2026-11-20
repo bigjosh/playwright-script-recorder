@@ -1,4 +1,4 @@
-"""Offline click-reassignment checks; no real windows or machine input."""
+"""Offline click pause, preview, and reassignment checks."""
 
 import json
 from pathlib import Path
@@ -13,6 +13,12 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import playwrightscriptlayout as layouts
 import playwrightscriptlib as psl
+
+
+POINT_BUTTONS = ("Next Step", "Run Continuously", "Reassign click location",
+                 "Show click location", "STOP")
+SHOW = POINT_BUTTONS.index("Show click location")
+STOP = POINT_BUTTONS.index("STOP")
 
 
 class ClickReassignmentTests(unittest.TestCase):
@@ -45,6 +51,7 @@ class ClickReassignmentTests(unittest.TestCase):
         self.prompt = self.patch(layouts, "prompt_definition",
                                  side_effect=AssertionError("Already opted into point selection"))
         self.picker = self.patch(layouts, "pick_on_image", return_value=(90, 80))
+        self.preview = self.patch(layouts, "show_click_preview")
         self.events = []
         self.guard = self.patch(psl, "_wait_for_click_guard",
                                side_effect=lambda: self.events.append("guard"))
@@ -62,15 +69,15 @@ class ClickReassignmentTests(unittest.TestCase):
         self.assertEqual(self.events, [])
         self.page.mouse.click.assert_not_called()
         self.page.mouse.dblclick.assert_not_called()
+        self.page.mouse.move.assert_not_called()
         self.page.keyboard.press.assert_not_called()
         self.page.keyboard.type.assert_not_called()
 
     def test_reassignment_returns_to_same_pause_without_input(self):
         def pause(message, buttons, **options):
             self.assert_no_input()
-            self.assertEqual(options, {"close_choice": 3})
-            self.assertEqual(buttons, (
-                "Next Step", "Run Continuously", "Reassign click location", "STOP"))
+            self.assertEqual(options, {"close_choice": STOP})
+            self.assertEqual(buttons, POINT_BUTTONS)
             if self.window.call_count == 1:
                 self.assertEqual(self.point_file.read_bytes(), self.original)
                 return 2
@@ -102,9 +109,72 @@ class ClickReassignmentTests(unittest.TestCase):
         self.page.mouse.dblclick.assert_called_once_with(90, 80)
         self.page.mouse.click.assert_not_called()
 
+    def test_preview_returns_to_same_pause_and_stop_leaves_point_untouched(self):
+        self.window.side_effect = [SHOW, STOP]
+        with self.assertRaises(SystemExit) as stopped:
+            psl.info("Click X field", point="x-field")
+        self.assertEqual(stopped.exception.code, 2)
+        self.preview.assert_called_once_with("x-field", self.capture.return_value, (20, 30))
+        self.capture.assert_called_once()
+        self.assertEqual(self.window.call_args_list[0], self.window.call_args_list[1])
+        self.assertTrue(psl._pause_on_info)
+        self.assertEqual(self.point_file.read_bytes(), self.original)
+        self.picker.assert_not_called()
+        self.assert_no_input()
+
+    def test_preview_after_reassignment_uses_current_pixels_and_saved_point(self):
+        self.window.side_effect = [SHOW, 2, SHOW, 0]
+        first, picker_image, last = [
+            Image.new("RGB", (640, 480), color) for color in ("red", "green", "blue")
+        ]
+        self.capture.side_effect = [first, picker_image, last]
+        psl.info("Double-click X field", point="x-field")
+        self.assertEqual(self.preview.call_args_list, [
+            mock.call("x-field", first, (20, 30)), mock.call("x-field", last, (90, 80)),
+        ])
+        self.assert_no_input()
+        psl.doubleClick("x-field")
+        self.assertEqual(self.events, ["guard", ("double", 90, 80)])
+
+    def test_missing_point_preview_leaves_definition_to_operator(self):
+        self.point_file.unlink()
+        self.window.side_effect = [SHOW, STOP]
+        with self.assertRaises(SystemExit):
+            psl.info("Click X field", point="x-field")
+        self.assertIn("Reassign click location", self.window.call_args.args[0])
+        self.assertFalse(self.point_file.exists())
+        self.prompt.assert_not_called()
+        self.picker.assert_not_called()
+        self.preview.assert_not_called()
+        self.assert_no_input()
+
+    def test_preview_refuses_mismatched_capture_then_waits_for_choice(self):
+        self.capture.return_value = Image.new("RGB", (639, 480))
+        self.window.side_effect = [SHOW, STOP]
+        with self.assertRaises(SystemExit):
+            psl.info("Click X field", point="x-field")
+        self.assertNotEqual(self.window.call_args_list[0], self.window.call_args_list[1])
+        self.preview.assert_not_called()
+        self.assert_no_input()
+
+    def test_preview_failures_report_error_and_allow_fresh_retry(self):
+        self.window.side_effect = [SHOW, SHOW, SHOW, STOP]
+        self.capture.side_effect = [RuntimeError("Screen disconnected"),
+                                    self.capture.return_value, self.capture.return_value]
+        self.preview.side_effect = [RuntimeError("Viewer unavailable"), None]
+        with self.assertRaises(SystemExit):
+            psl.info("Click X field", point="x-field")
+        messages = [call.args[0] for call in self.window.call_args_list]
+        self.assertIn("Screen disconnected", messages[1])
+        self.assertIn("Viewer unavailable", messages[2])
+        self.assertEqual(messages[0], messages[3])
+        self.assertEqual(self.preview.call_count, 2)
+        self.assertEqual(self.point_file.read_bytes(), self.original)
+        self.assert_no_input()
+
     def test_cancel_reassignment_returns_to_pause_and_stop_sends_nothing(self):
         self.picker.return_value = None
-        self.window.side_effect = [2, 3]
+        self.window.side_effect = [2, STOP]
         with self.assertRaises(SystemExit) as stopped:
             psl.info("Click X field", point="x-field")
         self.assertEqual(stopped.exception.code, 2)
@@ -113,7 +183,7 @@ class ClickReassignmentTests(unittest.TestCase):
         self.assert_no_input()
 
     def test_stop_after_successful_edit_does_not_send_pending_click(self):
-        self.window.side_effect = [2, 3]
+        self.window.side_effect = [2, STOP]
         with self.assertRaises(SystemExit):
             psl.info("Click X field", point="x-field")
         saved = json.loads(self.point_file.read_text(encoding="utf-8"))
@@ -165,10 +235,10 @@ class ClickReassignmentTests(unittest.TestCase):
     def test_point_pause_ui_failure_falls_back_to_console_with_stop_on_eof(self):
         self.window.side_effect = RuntimeError("No display")
         self.console.side_effect = None
-        self.console.return_value = 3
+        self.console.return_value = STOP
         with self.assertRaises(SystemExit):
             psl.info("Click X field", point="x-field")
-        self.assertEqual(self.console.call_args.kwargs, {"close_choice": 3})
+        self.assertEqual(self.console.call_args.kwargs, {"close_choice": STOP})
         self.picker.assert_not_called()
         self.assert_no_input()
 
@@ -200,8 +270,7 @@ class ClickReassignmentTests(unittest.TestCase):
 class PauseCloseBehaviorTests(unittest.TestCase):
     def test_console_eof_stops_named_click_pause(self):
         with mock.patch("builtins.input", side_effect=EOFError), mock.patch("builtins.print"):
-            self.assertEqual(psl._pause_console("Click", ("Next", "Run", "Reassign", "STOP"),
-                                                close_choice=3), 3)
+            self.assertEqual(psl._pause_console("Click", POINT_BUTTONS, close_choice=STOP), STOP)
 
     def test_console_eof_keeps_existing_ordinary_pause_behavior(self):
         with mock.patch("builtins.input", side_effect=EOFError), mock.patch("builtins.print"):
@@ -218,9 +287,8 @@ class PauseCloseBehaviorTests(unittest.TestCase):
         with mock.patch.object(tk, "Tk", return_value=root), \
                 mock.patch.object(tk, "Label"), mock.patch.object(tk, "Frame"), \
                 mock.patch.object(tk, "Button"):
-            choice = psl._pause_window("Click", ("Next", "Run", "Reassign", "STOP"),
-                                       close_choice=3)
-        self.assertEqual(choice, 3)
+            choice = psl._pause_window("Click", POINT_BUTTONS, close_choice=STOP)
+        self.assertEqual(choice, STOP)
         root.destroy.assert_called_once_with()
 
     def test_pause_construction_error_cleans_up_window(self):
@@ -230,8 +298,7 @@ class PauseCloseBehaviorTests(unittest.TestCase):
         with mock.patch.object(tk, "Tk", return_value=root), \
                 mock.patch.object(tk, "Label", side_effect=RuntimeError("UI failed")):
             with self.assertRaisesRegex(RuntimeError, "UI failed"):
-                psl._pause_window("Click", ("Next", "Run", "Reassign", "STOP"),
-                                   close_choice=3)
+                psl._pause_window("Click", POINT_BUTTONS, close_choice=STOP)
         root.destroy.assert_called_once_with()
 
 

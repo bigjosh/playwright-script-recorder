@@ -99,7 +99,12 @@ psl.info('Select X', point='x-field')
 psl.doubleClick('x-field')
 ```
 
-With `pauseOnInfo(True)`, these pauses offer **Reassign click location**. Pick
+With `pauseOnInfo(True)`, choose **Show click location** to see a fresh
+screenshot of the browser viewport with the saved point marked in the overview
+and a 3× close-up. Choose **Back to step** to return to the same pause.
+Open the preview again to see updated pixels.
+
+To move the target, choose **Reassign click location**. Pick
 the new target on a frozen screenshot; it is saved without clicking the target,
 and the same step remains paused until **Next Step** or **Run Continuously**.
 Cancel/Escape/close in the picker leaves the old point and returns to the pause.
